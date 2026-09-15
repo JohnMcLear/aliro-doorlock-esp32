@@ -208,6 +208,20 @@ APPLIED_PATCHES=()
 OVERLAY_COPIED=0
 BOARD_CONFIG_COPIED=0
 
+# GNU patch 2.7 reads a git "index <sha>..0000000" header line as a file
+# deletion. Patches 0003-0005 carry such lines, so on Linux the dry-run
+# fails with "Not deleting file ... as content differs from patch". The
+# index lines carry no content, so strip them before patch reads the file.
+# GNU patch also writes numbered ~N~ backups into the esp-matter tree when
+# a hunk applies with fuzz; turn that off where the flag exists.
+patch_stream() {
+  sed -E '/^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]+)?$/d' "$1"
+}
+PATCH_EXTRA_FLAGS=()
+if patch --version 2>/dev/null | grep -q 'GNU patch'; then
+  PATCH_EXTRA_FLAGS+=(--no-backup-if-mismatch)
+fi
+
 cleanup() {
   if [[ "$OVERLAY_COPIED" == "1" && -f "$OVERLAY_LOCAL" ]]; then
     command rm -f "$OVERLAY_LOCAL"
@@ -220,8 +234,8 @@ cleanup() {
   fi
   local patch_index
   for ((patch_index = ${#APPLIED_PATCHES[@]} - 1; patch_index >= 0; patch_index--)); do
-    if ! patch --batch --reverse -V none -r /dev/null -p1 -d "$ESP_MATTER_SRC" \
-        < "${APPLIED_PATCHES[$patch_index]}" >/dev/null; then
+    if ! patch --batch --reverse -V none ${PATCH_EXTRA_FLAGS[@]+"${PATCH_EXTRA_FLAGS[@]}"} -r /dev/null -p1 -d "$ESP_MATTER_SRC" \
+        < <(patch_stream "${APPLIED_PATCHES[$patch_index]}") >/dev/null; then
       echo "warning: could not remove source patch ${APPLIED_PATCHES[$patch_index]}" >&2
     fi
   done
@@ -265,17 +279,17 @@ fi
 
 # Apply each audited project delta in file-name order.
 for SOURCE_PATCH in "${SOURCE_PATCHES[@]}"; do
-  if patch --batch --reverse --forward --dry-run -V none -r /dev/null -p1 -d "$ESP_MATTER_SRC" \
-      < "$SOURCE_PATCH" >/dev/null 2>&1; then
+  if patch --batch --reverse --forward --dry-run -V none ${PATCH_EXTRA_FLAGS[@]+"${PATCH_EXTRA_FLAGS[@]}"} -r /dev/null -p1 -d "$ESP_MATTER_SRC" \
+      < <(patch_stream "$SOURCE_PATCH") >/dev/null 2>&1; then
     echo "error: source patch already appears to be applied: $SOURCE_PATCH" >&2
     exit 2
   fi
-  if ! patch --batch --forward --dry-run -V none -r /dev/null -p1 -d "$ESP_MATTER_SRC" < "$SOURCE_PATCH"; then
+  if ! patch --batch --forward --dry-run -V none ${PATCH_EXTRA_FLAGS[@]+"${PATCH_EXTRA_FLAGS[@]}"} -r /dev/null -p1 -d "$ESP_MATTER_SRC" < <(patch_stream "$SOURCE_PATCH"); then
     echo "error: source patch dry-run failed: $SOURCE_PATCH" >&2
     exit 2
   fi
   APPLIED_PATCHES+=("$SOURCE_PATCH")
-  if ! patch --batch --forward -V none -r /dev/null -p1 -d "$ESP_MATTER_SRC" < "$SOURCE_PATCH"; then
+  if ! patch --batch --forward -V none ${PATCH_EXTRA_FLAGS[@]+"${PATCH_EXTRA_FLAGS[@]}"} -r /dev/null -p1 -d "$ESP_MATTER_SRC" < <(patch_stream "$SOURCE_PATCH"); then
     echo "error: could not apply source patch $SOURCE_PATCH" >&2
     exit 2
   fi
@@ -731,17 +745,17 @@ idf.py \
 # Managed components exist only after dependency resolution. Apply their
 # audited patch now and include it in reverse-order cleanup.
 for DEPENDENCY_PATCH in "${DEPENDENCY_PATCHES[@]}"; do
-  if patch --batch --reverse --forward --dry-run -V none -r /dev/null -p1 -d "$ESP_MATTER_SRC" \
-      < "$DEPENDENCY_PATCH" >/dev/null 2>&1; then
+  if patch --batch --reverse --forward --dry-run -V none ${PATCH_EXTRA_FLAGS[@]+"${PATCH_EXTRA_FLAGS[@]}"} -r /dev/null -p1 -d "$ESP_MATTER_SRC" \
+      < <(patch_stream "$DEPENDENCY_PATCH") >/dev/null 2>&1; then
     echo "error: dependency patch already appears to be applied: $DEPENDENCY_PATCH" >&2
     exit 2
   fi
-  if ! patch --batch --forward --dry-run -V none -r /dev/null -p1 -d "$ESP_MATTER_SRC" < "$DEPENDENCY_PATCH"; then
+  if ! patch --batch --forward --dry-run -V none ${PATCH_EXTRA_FLAGS[@]+"${PATCH_EXTRA_FLAGS[@]}"} -r /dev/null -p1 -d "$ESP_MATTER_SRC" < <(patch_stream "$DEPENDENCY_PATCH"); then
     echo "error: dependency patch dry-run failed: $DEPENDENCY_PATCH" >&2
     exit 2
   fi
   APPLIED_PATCHES+=("$DEPENDENCY_PATCH")
-  if ! patch --batch --forward -V none -r /dev/null -p1 -d "$ESP_MATTER_SRC" < "$DEPENDENCY_PATCH"; then
+  if ! patch --batch --forward -V none ${PATCH_EXTRA_FLAGS[@]+"${PATCH_EXTRA_FLAGS[@]}"} -r /dev/null -p1 -d "$ESP_MATTER_SRC" < <(patch_stream "$DEPENDENCY_PATCH"); then
     echo "error: could not apply dependency patch $DEPENDENCY_PATCH" >&2
     exit 2
   fi
