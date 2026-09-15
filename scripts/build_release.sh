@@ -13,7 +13,9 @@
 #   --source-check    apply and validate source patches, run the parser
 #                     test, clean the source tree, and exit without idf.py
 #   --variant <id>    build variant id; default nanoc6-thread. Values come
-#                     from firmware/variants.json.
+#                     from firmware/variants.json: the release matrix under
+#                     "variants", or a source-only board under
+#                     "bench_variants" (for example c6-steval-thread).
 #
 # Required environment:
 #   ESP_MATTER_SRC   absolute path to a clean esp-matter source tree,
@@ -70,7 +72,10 @@ import json, sys
 with open(sys.argv[1]) as source:
     data = json.load(source)
 variant_id = sys.argv[2]
-variants = data.get("variants", {})
+# Release-matrix variants come first. Bench variants are source-only boards
+# that the installer and scripts/assemble_release.py never publish.
+variants = dict(data.get("bench_variants", {}))
+variants.update(data.get("variants", {}))
 if variant_id not in variants:
     print(f"error: unknown variant '{variant_id}'", file=sys.stderr)
     print(f"       known variants: {', '.join(sorted(variants))}", file=sys.stderr)
@@ -100,6 +105,12 @@ keys = [
     "board_config_header",
     "partition_layout_id",
     "partition_table_sha256",
+    "nfc_driver",
+    "nfc_spi_sclk_gpio",
+    "nfc_spi_miso_gpio",
+    "nfc_spi_mosi_gpio",
+    "nfc_spi_cs_gpio",
+    "nfc_irq_gpio",
     "_esp_matter_pin",
     "_connectedhomeip_pin",
     "_release_tag_pattern",
@@ -113,6 +124,8 @@ patches = entry.get("source_patches", [])
 print("VARIANT_SOURCE_PATCHES=(" + " ".join(shlex.quote(str(p)) for p in patches) + ")")
 dep_patches = entry.get("dependency_patches", [])
 print("VARIANT_DEPENDENCY_PATCHES=(" + " ".join(shlex.quote(str(p)) for p in dep_patches) + ")")
+extra_dirs = entry.get("extra_component_dirs", [])
+print("VARIANT_EXTRA_COMPONENT_DIRS=(" + " ".join(shlex.quote(str(p)) for p in extra_dirs) + ")")
 PY
 )"
 
@@ -183,6 +196,27 @@ for rel in "${VARIANT_DEPENDENCY_PATCHES[@]}"; do
   DEPENDENCY_PATCHES+=("$REPO_ROOT/$rel")
 done
 BOARD_CONFIG_HEADER="$REPO_ROOT/$VARIANT_BOARD_CONFIG_HEADER"
+# The NFC driver defaults to the audited M5 Unit NFC path (managed m5nfc
+# plus patch 0005). st25r3916-spi builds firmware/components/st25r3916_spi
+# instead, handed to the door-lock CMakeLists through its
+# extra_components_dirs_append hook, so nothing is copied into esp-matter.
+VARIANT_NFC_DRIVER="${VARIANT_NFC_DRIVER:-m5nfc-i2c}"
+case "$VARIANT_NFC_DRIVER" in
+  m5nfc-i2c|st25r3916-spi) ;;
+  *) echo "error: variant $VARIANT_ID has unknown nfc_driver '$VARIANT_NFC_DRIVER'" >&2; exit 2 ;;
+esac
+EXTRA_COMPONENT_DIRS=""
+for rel in ${VARIANT_EXTRA_COMPONENT_DIRS[@]+"${VARIANT_EXTRA_COMPONENT_DIRS[@]}"}; do
+  if [[ ! -f "$REPO_ROOT/$rel/CMakeLists.txt" ]]; then
+    echo "error: extra component not found at $REPO_ROOT/$rel" >&2
+    exit 2
+  fi
+  EXTRA_COMPONENT_DIRS="${EXTRA_COMPONENT_DIRS:+$EXTRA_COMPONENT_DIRS;}$REPO_ROOT/$rel"
+done
+IDF_EXTRA_ARGS=()
+if [[ -n "$EXTRA_COMPONENT_DIRS" ]]; then
+  IDF_EXTRA_ARGS+=(-D "extra_components_dirs_append=$EXTRA_COMPONENT_DIRS")
+fi
 
 if [[ ! -f "$OVERLAY" ]]; then
   echo "error: overlay not found at $OVERLAY" >&2
@@ -577,6 +611,13 @@ validate_nanoc6_nfc_feedback() {
     echo "error: reader mutex must exist before the NFC task starts" >&2
     return 2
   fi
+  if [[ "$VARIANT_NFC_DRIVER" != "m5nfc-i2c" ]]; then
+    # The managed m5nfc source does not exist for this variant; the SPI
+    # driver's own ECP and ordering contract is checked separately.
+    validate_st25r3916_spi_dependencies
+    echo "=== $VARIANT_ID NFC: delegate ECP and configurable RGB feedback enabled ==="
+    return 0
+  fi
   for required_text in "${required_m5nfc_text[@]}"; do
     if ! grep -Fq "$required_text" "$m5nfc_source"; then
       echo "error: managed m5nfc source is missing: $required_text" >&2
@@ -594,6 +635,146 @@ validate_nanoc6_nfc_feedback() {
     return 2
   fi
   echo "=== NanoC6 NFC: ECP and configurable RGB feedback enabled ==="
+}
+
+validate_variant_nfc_spi_map() {
+  # For the SPI reader, variants.json, the board header and the overlay's
+  # Kconfig values must name the same five GPIOs.
+  if [[ "$VARIANT_NFC_DRIVER" != "st25r3916-spi" ]]; then
+    return 0
+  fi
+  local header="$BOARD_CONFIG_HEADER"
+  local pair
+  local json_value
+  local macro
+  local kconfig
+  local header_value
+  local overlay_value
+  for pair in \
+      "$VARIANT_NFC_SPI_SCLK_GPIO:ALIRO_BOARD_NFC_SPI_SCLK_GPIO:CONFIG_ST25R3916_SPI_PIN_SCLK" \
+      "$VARIANT_NFC_SPI_MISO_GPIO:ALIRO_BOARD_NFC_SPI_MISO_GPIO:CONFIG_ST25R3916_SPI_PIN_MISO" \
+      "$VARIANT_NFC_SPI_MOSI_GPIO:ALIRO_BOARD_NFC_SPI_MOSI_GPIO:CONFIG_ST25R3916_SPI_PIN_MOSI" \
+      "$VARIANT_NFC_SPI_CS_GPIO:ALIRO_BOARD_NFC_SPI_CS_GPIO:CONFIG_ST25R3916_SPI_PIN_CS" \
+      "$VARIANT_NFC_IRQ_GPIO:ALIRO_BOARD_NFC_IRQ_GPIO:CONFIG_ST25R3916_SPI_PIN_IRQ"; do
+    json_value="${pair%%:*}"
+    macro="${pair#*:}"; macro="${macro%%:*}"
+    kconfig="${pair##*:}"
+    header_value="$(awk -v name="$macro" '$1=="#define" && $2==name {print $3; exit}' "$header")"
+    overlay_value="$(awk -F= -v name="$kconfig" '$1==name {v=$2} END{print v}' "$OVERLAY")"
+    if [[ -z "$json_value" || "$json_value" != "$header_value" || "$json_value" != "$overlay_value" ]]; then
+      echo "error: $VARIANT_ID NFC pin mismatch: variants.json=$json_value $macro=$header_value $kconfig=$overlay_value" >&2
+      return 2
+    fi
+  done
+  echo "=== NFC SPI map ($VARIANT_ID): SCLK $VARIANT_NFC_SPI_SCLK_GPIO MISO $VARIANT_NFC_SPI_MISO_GPIO MOSI $VARIANT_NFC_SPI_MOSI_GPIO CS $VARIANT_NFC_SPI_CS_GPIO IRQ $VARIANT_NFC_IRQ_GPIO match header and overlay ==="
+}
+
+validate_st25r3916_spi_driver() {
+  # Source contract for firmware/components/st25r3916_spi, plus its host
+  # tests. Runs in --source-check too; it needs only a host C++ compiler.
+  if [[ "$VARIANT_NFC_DRIVER" != "st25r3916-spi" ]]; then
+    return 0
+  fi
+  local component="$REPO_ROOT/firmware/components/st25r3916_spi"
+  local driver="$component/src/st25r3916_spi_nfc.cpp"
+  local logic="$component/src/st25r3916_frame_logic.h"
+  local header="$component/include/m5nfc.h"
+  local isodep_dir="$component/third_party/yondoor_isodep"
+  local required_text
+  local ecp_line
+  local request_line
+  local file
+  local expected
+  local actual
+  local test_binary
+
+  for required_text in \
+      'esp_err_t m5nfc_init(void);' \
+      'esp_err_t m5nfc_set_ecp_identifier(const uint8_t *identifier, size_t identifier_len);' \
+      'void m5nfc_update(void);' \
+      'm5nfc_activation_result_t m5nfc_activate(void);' \
+      'void m5nfc_deactivate(void);' \
+      'esp_err_t m5nfc_message_exchange(const uint8_t *command, size_t command_len, uint8_t *response, size_t *response_len);' \
+      'M5NFC_ACTIVATION_NON_ISO_DEP'; do
+    if ! grep -Fq "$required_text" "$header"; then
+      echo "error: st25r3916_spi m5nfc.h is missing: $required_text" >&2
+      return 2
+    fi
+  done
+  if ! grep -Fq '0x6A, 0x02, 0xCB, 0x02, 0x06, 0x20, 0x42, 0x20' "$logic"; then
+    echo "error: st25r3916_spi ECP prefix is not the audited 6A 02 CB 02 06 20 42 20" >&2
+    return 2
+  fi
+  for required_text in \
+      'constexpr uint32_t kEcpResponseTimeoutMs = 12;' \
+      'constexpr uint32_t kEcpSettleTimeMs = 5;' \
+      'build_ecp_frame(clear ? nullptr : identifier, frame.data());' \
+      'vTaskDelay(std::max<TickType_t>(1, pdMS_TO_TICKS(kEcpSettleTimeMs)))' \
+      'constexpr uint8_t kIsoDepFsdi = 8;' \
+      '{kRegRxConf3, 0x00},' \
+      'command(kCmdResetRxGain)' \
+      'esphome::st25r::isodep_exchange_apdu(' \
+      'return M5NFC_ACTIVATION_NON_ISO_DEP;' \
+      'NFC-A tag selected without ISO-DEP ATQA=%04x SAK=%02x UID=%s'; do
+    if ! grep -Fq "$required_text" "$driver"; then
+      echo "error: st25r3916_spi driver is missing: $required_text" >&2
+      return 2
+    fi
+  done
+  # lf_en=1 blocks every ATQA on the ST25R3916B's tuned antenna.
+  if grep -Eq 'kRegRxConf3, *0x[eE]2' "$driver"; then
+    echo "error: st25r3916_spi must not write RX_CONF3=0xE2" >&2
+    return 2
+  fi
+  # The ECP frame goes out with CRC-A appended by the chip, before REQA.
+  ecp_line="$(grep -n -F 'if (send_aliro_ecp())' "$driver" | cut -d: -f1)"
+  request_line="$(grep -n -F 'if (!request_a(atqa))' "$driver" | cut -d: -f1)"
+  if [[ -z "$ecp_line" || -z "$request_line" || "$ecp_line" -ge "$request_line" ]]; then
+    echo "error: Aliro ECP must run before the NFC-A request" >&2
+    return 2
+  fi
+  if ! sed -n '/^bool send_aliro_ecp()/,/^}/p' "$driver" | grep -Fq 'req.tx_crc = true;'; then
+    echo "error: the ECP frame must be transmitted with CRC-A" >&2
+    return 2
+  fi
+  # The ISO-DEP framing headers are copied verbatim; keep them that way.
+  for file in isodep_apdu.h isodep_wtx.h; do
+    expected="$(awk -v f="$file" '$2==f {print $1}' "$isodep_dir/PROVENANCE.txt")"
+    actual="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$isodep_dir/$file")"
+    if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+      echo "error: $file differs from the copy recorded in PROVENANCE.txt" >&2
+      return 2
+    fi
+  done
+
+  test_binary="$(mktemp "${TMPDIR:-/tmp}/st25r3916-frame-logic.XXXXXX")"
+  if ! "${CXX:-c++}" -std=gnu++17 -Wall -Wextra -Werror -I "$component/src" \
+      "$REPO_ROOT/firmware/tests/st25r3916_frame_logic_test.cpp" -o "$test_binary" || ! "$test_binary"; then
+    command rm -f "$test_binary"
+    echo "error: st25r3916 frame logic host test failed" >&2
+    return 2
+  fi
+  command rm -f "$test_binary"
+  test_binary="$(mktemp "${TMPDIR:-/tmp}/isodep-test.XXXXXX")"
+  if ! "${CXX:-c++}" -std=c++11 -Wall -Wextra -Werror -I "$isodep_dir" \
+      "$REPO_ROOT/firmware/tests/isodep/test_isodep.cpp" -o "$test_binary" || ! "$test_binary" >/dev/null; then
+    command rm -f "$test_binary"
+    echo "error: ISO-DEP host tests failed" >&2
+    return 2
+  fi
+  command rm -f "$test_binary"
+  echo "=== st25r3916_spi: source contract, frame logic test and 23 ISO-DEP tests passed ==="
+}
+
+validate_st25r3916_spi_dependencies() {
+  # After dependency resolution, the M5 stack must be absent so the only
+  # m5nfc_* symbols linked are the SPI driver's.
+  local dependency_lock="$APP_DIR/dependencies.lock"
+  if [[ -d "$APP_DIR/managed_components/m5nfc" ]] || grep -Eq '^  m5nfc:' "$dependency_lock" 2>/dev/null; then
+    echo "error: managed m5nfc is still resolved for $VARIANT_ID; patch 0022 did not take effect" >&2
+    echo "       (remove $APP_DIR/managed_components and dependencies.lock left by another variant)" >&2
+    return 2
+  fi
 }
 
 validate_aliro_settings() {
@@ -710,6 +891,8 @@ validate_aliro_settings
 validate_aliro_tap_toggle
 validate_variant_transport_exclusivity
 validate_variant_board_map
+validate_variant_nfc_spi_map
+validate_st25r3916_spi_driver
 
 if [[ "$SOURCE_CHECK_ONLY" == "1" ]]; then
   echo "=== Source patch check complete for variant $VARIANT_ID; idf.py was not run ==="
@@ -739,6 +922,7 @@ idf.py \
   -D CLI_ALIRO_VARIANT_ID="$VARIANT_ID" \
   -D CLI_ALIRO_TRANSPORT_ID="$VARIANT_TRANSPORT" \
   -D CLI_ALIRO_PROJECT_NAME="$VARIANT_PROJECT_NAME" \
+  ${IDF_EXTRA_ARGS[@]+"${IDF_EXTRA_ARGS[@]}"} \
   -D SDKCONFIG_DEFAULTS="$VARIANT_BASE_SDKCONFIG;$(basename "$OVERLAY")" \
   set-target "$VARIANT_CHIP"
 
@@ -770,6 +954,7 @@ idf.py \
   -D CLI_ALIRO_VARIANT_ID="$VARIANT_ID" \
   -D CLI_ALIRO_TRANSPORT_ID="$VARIANT_TRANSPORT" \
   -D CLI_ALIRO_PROJECT_NAME="$VARIANT_PROJECT_NAME" \
+  ${IDF_EXTRA_ARGS[@]+"${IDF_EXTRA_ARGS[@]}"} \
   build
 
 echo "=== size ==="

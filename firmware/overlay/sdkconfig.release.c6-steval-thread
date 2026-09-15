@@ -1,0 +1,35 @@
+# Release overlay for the c6-steval-thread bench variant (ESP32-C6 devkit
+# wired to an ST STEVAL-MB17149B over SPI, Matter over Thread).
+#
+# Layered on top of examples/door_lock/sdkconfig.esp32c6.aliro. The base
+# supplies every Aliro, Thread, BLE, mbedTLS and partition setting. Its
+# CONFIG_ST25R3916_PIN_SDA/SCL lines belong to the m5nfc component, which
+# this variant does not build, so idf.py reports them as unknown and
+# ignores them.
+
+# --- BOOT button on GPIO 9, active-low -----------------------------------
+CONFIG_BSP_BUTTONS_NUM=1
+CONFIG_BSP_BUTTON_1_TYPE_GPIO=y
+CONFIG_BSP_BUTTON_1_GPIO=9
+CONFIG_BSP_BUTTON_1_LEVEL=0
+
+# --- No BSP LEDs ---------------------------------------------------------
+# The audited Aliro source drives the devkit's WS2812 on GPIO 8 itself.
+CONFIG_BSP_LEDS_NUM=0
+
+# --- Native USB console ---------------------------------------------------
+# The devkit's USB port used here is the ESP32-C6 USB Serial/JTAG
+# controller (303a:1001, /dev/ttyACM*).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# --- ST25R3916B on SPI (st25r3916_spi component) --------------------------
+# Must match firmware/board_config/c6_steval.h and variants.json.
+CONFIG_ST25R3916_SPI_HOST=1
+CONFIG_ST25R3916_SPI_PIN_SCLK=19
+CONFIG_ST25R3916_SPI_PIN_MISO=10
+CONFIG_ST25R3916_SPI_PIN_MOSI=18
+CONFIG_ST25R3916_SPI_PIN_CS=6
+CONFIG_ST25R3916_SPI_PIN_IRQ=7
+CONFIG_ST25R3916_SPI_FREQ_HZ=1000000
+CONFIG_ST25R3916_TRANSCEIVE_TIMEOUT_MS=100
+CONFIG_ST25R3916_SPI_ANTENNA_TUNING=y

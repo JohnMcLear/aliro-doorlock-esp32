@@ -178,5 +178,60 @@
       "status": "planned",
       "notes": "No verified hardware run yet; source-only build stamps the approved partition-table SHA-256."
     }
+  },
+  "bench_variants": {
+    "c6-steval-thread": {
+      "id": "c6-steval-thread",
+      "project_name": "aliro-c6-steval-thread",
+      "product_label": "Aliro door lock \u2014 ESP32-C6 devkit + STEVAL-MB17149B (Matter over Thread)",
+      "board_id": "c6-steval",
+      "board_label": "ESP32-C6 devkit + ST STEVAL-MB17149B (ST25R3916B, SPI)",
+      "chip": "esp32c6",
+      "chip_family": "ESP32-C6",
+      "flash_size": "4MB",
+      "transport": "thread",
+      "transport_label": "Matter over Thread",
+      "transport_requirements": "You need a Thread border router on your LAN.",
+      "base_sdkconfig": "sdkconfig.esp32c6.aliro",
+      "base_sdkconfig_source": "upstream",
+      "release_overlay": "firmware/overlay/sdkconfig.release.c6-steval-thread",
+      "source_patches": [
+        "firmware/patches/0001-print-onboarding-codes.patch",
+        "firmware/patches/0002-advertise-aliro-credentials-only.patch",
+        "firmware/patches/0003-add-nanoc6-rgb-feedback.patch",
+        "firmware/patches/0004-wire-aliro-ecp-and-generic-tags.patch",
+        "firmware/patches/0006-add-aliro-settings.patch",
+        "firmware/patches/0007-toggle-lock-on-aliro-tap.patch",
+        "firmware/patches/0008-generalize-board-pins.patch",
+        "firmware/patches/0022-use-st25r3916-spi-reader.patch"
+      ],
+      "dependency_patches": [],
+      "extra_component_dirs": [
+        "firmware/components/st25r3916_spi"
+      ],
+      "board_config_header": "firmware/board_config/c6_steval.h",
+      "nfc_driver": "st25r3916-spi",
+      "nfc_spi_sclk_gpio": 19,
+      "nfc_spi_miso_gpio": 10,
+      "nfc_spi_mosi_gpio": 18,
+      "nfc_spi_cs_gpio": 6,
+      "nfc_irq_gpio": 7,
+      "rgb_data_gpio": 8,
+      "rgb_power_gpio": null,
+      "has_rgb_power_pin": false,
+      "user_button_gpio": 9,
+      "user_button_active_low": true,
+      "partition_layout_id": "esp32c6-door-lock-4mb-v1",
+      "partition_table_sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
+      "ota_slot_size_hex": "0x1E0000",
+      "ota_offsets_hex": [
+        "0x20000",
+        "0x200000"
+      ],
+      "improv_wait_time": 0,
+      "matter_commissioning": "ble",
+      "status": "bench",
+      "notes": "Source-only bench variant. Not part of the web installer release matrix, so it lives under bench_variants and scripts/assemble_release.py and the installer never see it. The ST25R3916B replaces the M5 Unit NFC; patch 0005 does not apply."
+    }
   }
 }
