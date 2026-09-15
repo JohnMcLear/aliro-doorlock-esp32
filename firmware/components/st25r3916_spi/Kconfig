@@ -1,0 +1,59 @@
+menu "ST25R3916 SPI NFC reader"
+
+    config ST25R3916_SPI_HOST
+        int "SPI host (1 = SPI2_HOST)"
+        default 1
+        help
+            ESP-IDF spi_host_device_t value. SPI2_HOST is the general purpose
+            SPI controller on ESP32-C6.
+
+    config ST25R3916_SPI_PIN_SCLK
+        int "SCLK GPIO"
+        default 19
+
+    config ST25R3916_SPI_PIN_MISO
+        int "MISO GPIO"
+        default 10
+
+    config ST25R3916_SPI_PIN_MOSI
+        int "MOSI GPIO"
+        default 18
+
+    config ST25R3916_SPI_PIN_CS
+        int "CS GPIO"
+        default 6
+
+    config ST25R3916_SPI_PIN_IRQ
+        int "IRQ GPIO (-1 to poll)"
+        default 7
+        help
+            ST25R3916 interrupt output. With -1 the driver polls the
+            interrupt registers once per FreeRTOS tick, which works but adds
+            latency to every NFC frame.
+
+    config ST25R3916_SPI_FREQ_HZ
+        int "SPI clock (Hz)"
+        default 1000000
+        range 100000 10000000
+        help
+            The ST25R3916 accepts up to 10 MHz. The default leaves margin for
+            flying leads between a devkit and an evaluation board; the boot
+            self-test reads registers back and refuses to run if the link is
+            not clean.
+
+    config ST25R3916_TRANSCEIVE_TIMEOUT_MS
+        int "Minimum ISO-DEP frame waiting time (ms)"
+        default 100
+        help
+            Floor for the FWT taken from the tag's ATS. Same meaning and
+            default as the m5nfc component this driver replaces.
+
+    config ST25R3916_SPI_ANTENNA_TUNING
+        bool "Tune antenna capacitors at start-up"
+        default y
+        help
+            Hill-climb ANT_TUNE_A/ANT_TUNE_B for the largest field amplitude.
+            Only boards with varicaps on the AAT outputs benefit; the
+            STEVAL-MB17149B has them.
+
+endmenu

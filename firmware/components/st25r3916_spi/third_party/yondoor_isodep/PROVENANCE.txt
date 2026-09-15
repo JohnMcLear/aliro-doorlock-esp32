@@ -1,0 +1,17 @@
+isodep_apdu.h and isodep_wtx.h are copied unmodified from John McLear's
+ST25R3916 ESPHome component (esphome_st25r_yondoor/components/st25r/),
+doorplan commit 9a4003b7781c86944071279488461527e2173a95 (2026-09-10,
+"ISO-DEP block chaining, so the transport can carry an Aliro transaction").
+That component is MIT licensed.
+
+They have no ESPHome dependency; the esphome::st25r namespace is historical.
+Do not edit them here. Fix upstream and copy again, so the two stay
+byte-identical and the host tests keep meaning the same thing in both places.
+
+SHA-256 at copy time:
+f829b1004128edc1d6f130973042f4f52b620e8208a1136cfb3d366a02fd2755  isodep_apdu.h
+a010ed625155756dcc6a547b9d64330c06f2ad10fb45b9db6bf715a701f28baf  isodep_wtx.h
+
+Their 23 host tests are copied, also unmodified, to
+firmware/tests/isodep/test_isodep.cpp
+cd10537c08a95951313d533b7c10170871d3ab15b3a1c8dcbbef269d7117d7d7  test_isodep.cpp
