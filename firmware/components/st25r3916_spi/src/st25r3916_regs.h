@@ -58,6 +58,7 @@ constexpr uint8_t kRegIcIdentity = 0x3F;
 
 // Space B
 constexpr uint8_t kRegEmdSupConf = kSpaceB | 0x05;
+constexpr uint8_t kRegFieldOnGt = kSpaceB | 0x15;
 constexpr uint8_t kRegCorrConf1 = kSpaceB | 0x0C;
 constexpr uint8_t kRegCorrConf2 = kSpaceB | 0x0D;
 constexpr uint8_t kRegAuxMod = kSpaceB | 0x28;
@@ -80,6 +81,7 @@ constexpr uint8_t kCmdTransmitWithCrc = 0xC4;
 constexpr uint8_t kCmdTransmitWithoutCrc = 0xC5;
 constexpr uint8_t kCmdTransmitReqa = 0xC6;
 constexpr uint8_t kCmdTransmitWupa = 0xC7;
+constexpr uint8_t kCmdInitialRfCollision = 0xC8;
 constexpr uint8_t kCmdMeasureAmplitude = 0xD3;
 constexpr uint8_t kCmdResetRxGain = 0xD5;
 constexpr uint8_t kCmdAdjustRegulators = 0xD6;
@@ -103,6 +105,9 @@ constexpr uint8_t kIoConf2IoDrvLvl = 0x04;
 constexpr uint8_t kOpControlEn = 0x80;
 constexpr uint8_t kOpControlRxEn = 0x40;
 constexpr uint8_t kOpControlTxEn = 0x08;
+constexpr uint8_t kOpControlEnFdMask = 0x03;
+constexpr uint8_t kOpControlEnFdManualCa = 0x01;
+constexpr uint8_t kOpControlEnFdAuto = 0x03;
 
 // MODE
 constexpr uint8_t kModeIso14443a = 0x08;  // om = 0001b, tr_am = OOK
@@ -113,6 +118,7 @@ constexpr uint8_t kIso14443aAntcl = 0x01;
 // AUX
 constexpr uint8_t kAuxNoCrcRx = 0x80;
 constexpr uint8_t kAuxDisCorr = 0x04;
+constexpr uint8_t kAuxNfcNMask = 0x03;
 
 // TIMER_EMV_CONTROL
 constexpr uint8_t kTimerEmvNrtStep4096 = 0x01;
@@ -137,7 +143,8 @@ constexpr uint8_t kFifoStatus2NpLb = 0x01;
 constexpr uint16_t kFifoDepth = 512;
 
 // 32-bit interrupt view: byte 0 = IRQ_MAIN (0x1A), byte 1 = IRQ_TIMER_NFC
-// (0x1B), byte 2 = IRQ_ERROR_WUP (0x1C). Same layout as RFAL.
+// (0x1B), byte 2 = IRQ_ERROR_WUP (0x1C), byte 3 = IRQ_TARGET (0x1D). Same
+// layout as RFAL.
 constexpr uint32_t kIrqOsc = 0x00000080;
 constexpr uint32_t kIrqFwl = 0x00000040;
 constexpr uint32_t kIrqRxs = 0x00000020;
@@ -148,6 +155,11 @@ constexpr uint32_t kIrqRxRest = 0x00000002;
 constexpr uint32_t kIrqDct = 0x00008000;
 constexpr uint32_t kIrqNre = 0x00004000;
 constexpr uint32_t kIrqGpe = 0x00002000;
+constexpr uint32_t kIrqEon = 0x00001000;
+constexpr uint32_t kIrqEof = 0x00000800;
+constexpr uint32_t kIrqCac = 0x00000400;  // collision during RF collision avoidance
+constexpr uint32_t kIrqCat = 0x00000200;  // minimum guard time after field on elapsed
+constexpr uint32_t kIrqApon = 0x20000000; // collision avoidance done, field on
 constexpr uint32_t kIrqCrc = 0x00800000;
 constexpr uint32_t kIrqPar = 0x00400000;
 constexpr uint32_t kIrqErr2 = 0x00200000;

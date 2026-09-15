@@ -661,6 +661,42 @@ esp_err_t spi_self_test()
     return ESP_OK;
 }
 
+// RFAL st25r3916PerformCollisionAvoidance(INITIAL_RF_COLLISION) followed by
+// st25r3916TxRxOn.
+esp_err_t field_on()
+{
+    ESP_RETURN_ON_ERROR(write_reg(kRegFieldOnGt, 0x00), kTag, "FIELD_ON_GT write failed");
+    ESP_RETURN_ON_ERROR(modify_reg(kRegOpControl, kOpControlEnFdMask, kOpControlEnFdManualCa), kTag,
+                        "OP_CONTROL write failed");
+    ESP_RETURN_ON_ERROR(modify_reg(kRegAux, kAuxNfcNMask, 0x00), kTag, "AUX write failed");
+    ESP_RETURN_ON_ERROR(irq_set_enabled(kIrqUsed | kIrqCac | kIrqCat | kIrqApon), kTag, "IRQ mask write failed");
+    irq_clear(kIrqCac | kIrqCat | kIrqApon | kIrqEon | kIrqEof);
+
+    ESP_RETURN_ON_ERROR(command(kCmdInitialRfCollision), kTag, "field-on command failed");
+    uint32_t hit = irq_wait(kIrqCac | kIrqApon, 20);
+    esp_err_t result = ESP_OK;
+    if (hit & kIrqCac) {
+        ESP_LOGE(kTag, "field on refused: another RF field is present (collision avoidance)");
+        result = ESP_ERR_INVALID_STATE;
+    } else if (hit & kIrqApon) {
+        if (irq_wait(kIrqCat, 20) == 0) {
+            ESP_LOGW(kTag, "field on: no guard-time interrupt after APON");
+        }
+    } else {
+        ESP_LOGE(kTag, "field on: no APON or CAC interrupt from collision avoidance");
+        result = ESP_ERR_TIMEOUT;
+    }
+
+    (void)modify_reg(kRegOpControl, kOpControlEnFdMask, kOpControlEnFdAuto);
+    (void)irq_take(kIrqEon | kIrqEof);
+    (void)irq_set_enabled(kIrqUsed);
+    if (result != ESP_OK) {
+        return result;
+    }
+    ESP_RETURN_ON_ERROR(modify_reg(kRegOpControl, 0, kOpControlRxEn | kOpControlTxEn), kTag, "field on failed");
+    return ESP_OK;
+}
+
 esp_err_t read_identity(uint8_t &identity)
 {
     identity = 0;
@@ -764,10 +800,14 @@ esp_err_t chip_configure()
     ESP_RETURN_ON_ERROR(write_reg(kRegAux, 0x00), kTag, "AUX write failed");  // correlator receiver
     g_aux_shadow = 0x00;
 
-    // Field on (RFAL st25r3916TxRxOn), then the 5 ms ISO/IEC 14443 guard time.
-    ESP_RETURN_ON_ERROR(write_reg(kRegOpControl, kOpControlEn | kOpControlRxEn | kOpControlTxEn), kTag,
-                        "field on failed");
-    delay_ms(5);
+    // Field on, the RFAL rfalFieldOnAndStartGT way: the initial RF collision
+    // avoidance command checks for someone else's field, switches ours on and
+    // reports it with the APON interrupt; only then are tx_en and rx_en set.
+    err = field_on();
+    if (err != ESP_OK) {
+        return err;
+    }
+    delay_ms(5);  // ISO/IEC 14443 guard time before the first command
 
 #if CONFIG_ST25R3916_SPI_ANTENNA_TUNING
     uint8_t tune_a = 0;
@@ -780,16 +820,20 @@ esp_err_t chip_configure()
     (void)write_reg(kRegAntTuneB, 0x40);
 #endif
 
+    // AUX_DISPLAY tx_on/rx_on are live activity flags on this chip, not a
+    // latched "field is on" state: on the STEVAL-MB17149B they read 0 while
+    // idle with tx_en set. The evidence for the field is the APON interrupt
+    // above and tx_en reading back in OP_CONTROL.
     uint8_t amplitude = 0;
     measure_field(amplitude);
-    (void)read_reg(kRegAuxDisplay, aux_display);
-    const bool tx_on = aux_display & kAuxDisplayTxOn;
-    const bool rx_on = aux_display & kAuxDisplayRxOn;
-    if (!tx_on) {
-        ESP_LOGE(kTag, "RF field did not come on: AUX_DISPLAY=0x%02x amplitude=%u", aux_display, amplitude);
+    uint8_t op_control = 0;
+    ESP_RETURN_ON_ERROR(read_reg(kRegOpControl, op_control), kTag, "OP_CONTROL read failed");
+    if ((op_control & (kOpControlEn | kOpControlRxEn | kOpControlTxEn)) !=
+        (kOpControlEn | kOpControlRxEn | kOpControlTxEn)) {
+        ESP_LOGE(kTag, "RF field did not come on: OP_CONTROL=0x%02x", op_control);
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(kTag, "RF field on: AUX_DISPLAY=0x%02x (tx_on=%d rx_on=%d) amplitude=%u", aux_display, tx_on, rx_on,
+    ESP_LOGI(kTag, "RF field on: collision avoidance APON received, OP_CONTROL=0x%02x amplitude=%u", op_control,
              amplitude);
     ESP_LOGI(kTag, "NFC-A poller ready: 106 kbit/s, RX_CONF3=0x00, FSDI=%u, SPI %d Hz", kIsoDepFsdi,
              CONFIG_ST25R3916_SPI_FREQ_HZ);
@@ -856,12 +900,14 @@ void m5nfc_update(void)
     if (now - g_last_health_us >= kHealthCheckIntervalUs) {
         g_last_health_us = now;
         uint8_t identity = 0;
-        uint8_t aux_display = 0;
+        uint8_t op_control = 0;
+        const uint8_t field_bits = kOpControlEn | kOpControlRxEn | kOpControlTxEn;
         const bool read_ok = read_reg(kRegIcIdentity, identity) == ESP_OK &&
-            read_reg(kRegAuxDisplay, aux_display) == ESP_OK;
-        if (!read_ok || identity != g_ic_identity || !(aux_display & kAuxDisplayTxOn)) {
-            ESP_LOGE(kTag, "reader health check failed: IC_IDENTITY=0x%02x (expected 0x%02x) AUX_DISPLAY=0x%02x",
-                     identity, g_ic_identity, aux_display);
+            read_reg(kRegOpControl, op_control) == ESP_OK;
+        if (!read_ok || identity != g_ic_identity || (op_control & field_bits) != field_bits) {
+            // A brown-out or a chip reset shows up as a lost register state.
+            ESP_LOGE(kTag, "reader health check failed: IC_IDENTITY=0x%02x (expected 0x%02x) OP_CONTROL=0x%02x",
+                     identity, g_ic_identity, op_control);
             g_chip_ready = false;
             g_next_reinit_us = now;
             return;

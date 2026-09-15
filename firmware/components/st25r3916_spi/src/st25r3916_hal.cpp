@@ -83,7 +83,7 @@ void drain_irq_registers()
             return;
         }
         g_pending_irqs |= static_cast<uint32_t>(regs[0]) | (static_cast<uint32_t>(regs[1]) << 8) |
-            (static_cast<uint32_t>(regs[2]) << 16);
+            (static_cast<uint32_t>(regs[2]) << 16) | (static_cast<uint32_t>(regs[3]) << 24);
         if (g_pin_irq < 0 || gpio_get_level(static_cast<gpio_num_t>(g_pin_irq)) == 0) {
             return;
         }
@@ -247,7 +247,7 @@ esp_err_t irq_set_enabled(uint32_t mask)
         err = write_reg(kRegIrqMaskErrorWup, static_cast<uint8_t>(~(mask >> 16) & 0xFF));
     }
     if (err == ESP_OK) {
-        err = write_reg(kRegIrqMaskTarget, 0xFF);
+        err = write_reg(kRegIrqMaskTarget, static_cast<uint8_t>(~(mask >> 24) & 0xFF));
     }
     return err;
 }

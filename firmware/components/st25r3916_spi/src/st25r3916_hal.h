@@ -43,7 +43,8 @@ esp_err_t fifo_read(uint8_t *data, size_t len);
 // folded into a pending set and bits are only consumed when a caller asks
 // for them.
 
-// Unmask exactly `mask` (32-bit RFAL layout), mask everything else.
+// Unmask exactly `mask` (32-bit RFAL layout: IRQ_MAIN, IRQ_TIMER_NFC,
+// IRQ_ERROR_WUP, IRQ_TARGET from low byte to high), mask everything else.
 esp_err_t irq_set_enabled(uint32_t mask);
 // Drop pending bits in `mask` after draining the chip registers.
 void irq_clear(uint32_t mask);
