@@ -52,6 +52,12 @@ tag `aliro-vX.Y.Z-devkit`.
   Boards with no power-enable pin (AtomS3 Lite) skip those calls at compile
   time. The macros default to the NanoC6 wiring so a source-only build
   without the board header still compiles.
+- `board_config/c6_steval.h`, `overlay/sdkconfig.release.c6-steval-thread`,
+  `patches/0022-use-st25r3916-spi-reader.patch` and
+  `components/st25r3916_spi/` make up the `c6-steval-thread` bench variant:
+  an ESP32-C6 devkit with an ST25R3916B on SPI (STEVAL-MB17149B). It is
+  listed under `bench_variants` in `variants.json` and is not published by
+  the installer. See `RELEASE.md`.
 - `RELEASE.md` contains the source pins, overlay symbols, build notes,
   and artifact contract.
 - `../scripts/build_release.sh` builds from a clean esp-matter snapshot

@@ -20,6 +20,12 @@ turn OpenThread off (where applicable). BLE stays on for Matter
 commissioning. No overlay enables Improv Wi-Fi; the phone supplies the
 Wi-Fi credentials over BLE.
 
+`variants.json` also carries `bench_variants`. These build from the same
+pinned sources with `scripts/build_release.sh --variant <id>`, but they
+are not part of the release matrix: the installer and
+`scripts/assemble_release.py` read only `variants`. See
+[Bench variant: `c6-steval-thread`](#bench-variant-c6-steval-thread).
+
 ## Pins
 
 | Component | Value |
@@ -262,6 +268,110 @@ legacy `aliro-c6-*` assets for the `nanoc6-thread` variant unchanged.
    `manifest.txt` to a staging directory.
 9. Replaces `artifacts/<tag>/` only after all checks pass. A failed
    package run keeps the prior complete artifact set.
+
+## Bench variant: `c6-steval-thread`
+
+An ESP32-C6 devkit wired over SPI to an ST STEVAL-MB17149B evaluation
+board (ST25R3916B), Matter over Thread. It replaces the M5 Unit NFC with
+`firmware/components/st25r3916_spi`, which provides the same six
+`m5nfc_*` functions, so the door-lock delegate and patches 0001-0004 and
+0006-0008 apply unchanged.
+
+| Signal | ESP32-C6 GPIO |
+|---|---|
+| SPI SCLK | 19 |
+| SPI MISO | 10 |
+| SPI MOSI | 18 |
+| SPI CS | 6 |
+| ST25R3916B IRQ | 7 |
+| WS2812 data (devkit on-board LED) | 8 |
+| BOOT button | 9 |
+
+The pins live in `firmware/board_config/c6_steval.h`, the Kconfig values
+in `firmware/overlay/sdkconfig.release.c6-steval-thread`, and the
+`variants.json` entry. The build script refuses to run if the three
+disagree.
+
+What differs from `nanoc6-thread`:
+
+- Patch 0005 is not applied. Patch
+  `0022-use-st25r3916-spi-reader.patch` removes the managed `m5nfc`
+  dependency from `main/idf_component.yml`.
+- The build passes `firmware/components/st25r3916_spi` to the door-lock
+  CMakeLists through its `extra_components_dirs_append` variable. Nothing
+  is copied into the esp-matter tree.
+- The source check adds the SPI driver's contract: the ECP prefix
+  `6A 02 CB 02 06 20 42 20`, the frame sent with CRC-A before REQA, the
+  12 ms response window and 5 ms settle, FSDI 8, `RX_CONF3=0x00`, and
+  `RESET_RX_GAIN` before each transceive. It checks that
+  `third_party/yondoor_isodep/isodep_*.h` still match the SHA-256 values
+  in `PROVENANCE.txt`. It compiles and runs
+  `firmware/tests/st25r3916_frame_logic_test.cpp` and the 23 ISO-DEP
+  tests in `firmware/tests/isodep/test_isodep.cpp`.
+- After `set-target` it fails if `m5nfc` is still resolved, so only one
+  set of `m5nfc_*` symbols can link.
+
+### Build and flash
+
+```
+. ~/esp/esp-idf-v5.5.4/export.sh
+export ESP_MATTER_SRC=~/esp/esp-matter   # clean checkout at 85c76a1
+scripts/build_release.sh --variant c6-steval-thread
+```
+
+Flash from the build directory with esptool, not `idf.py flash`. The
+build script removes its patches on exit, and `idf.py flash` rebuilds
+first, so it would compile the unpatched example.
+
+```
+cd "$ESP_MATTER_SRC/examples/door_lock/build"
+python -m esptool --chip esp32c6 -p /dev/ttyACM0 erase_flash      # first install only
+python -m esptool --chip esp32c6 -p /dev/ttyACM0 -b 460800 write_flash @flash_args
+```
+
+If a nanoc6 variant was built in the same tree before, delete
+`examples/door_lock/managed_components` and `dependencies.lock` first
+when the build script reports that `m5nfc` is still resolved. On a
+machine with little free RAM, limit ninja's parallelism; the Matter
+build uses about 1 GB per compile job.
+
+### What a healthy boot prints
+
+```
+st25r3916: ST25R3916B identified over SPI: IC_IDENTITY=0x31 (type 0x30, revision 1)
+st25r3916: oscillator stable; IRQ line on GPIO 7 verified
+st25r3916: RF field on: collision avoidance APON received, OP_CONTROL=0xcb amplitude=...
+st25r3916: NFC-A poller ready: 106 kbit/s, RX_CONF3=0x00, FSDI=8, SPI 1000000 Hz
+chip[SVR]: SetupQRCode: [MT:...]
+chip[SVR]: Manual pairing code: [...]
+st25r3916: NFC poller running: polls=... tags=0 ... rx_errors=0 ... spi_errors=0 irq_edges=...
+```
+
+The last line comes 30 s after boot and every 10 minutes after that.
+
+Known first-boot issue, not specific to this variant: on the first boot
+after `erase_flash`, the delegate logs
+`persistent_storage: get(62): Failed to get bytes` then
+`Aliro: Init(589): Failed to get reader group id`. `Init()` returns
+before it starts the `nfc_detect` task, so nothing polls until the next
+reset. The second boot logs `Aliro Reader is not configured` and polls.
+`SetAliroReaderConfig` does not start the task either, so reset the board
+once after a factory flash and before commissioning. Evidence:
+`lab_notes/2026-09-15-c6-steval-thread-boot.log`.
+
+### Tag and phone checks
+
+- Any NTAG or MIFARE tag: expect
+  `NFC-A tag selected without ISO-DEP ATQA=0044 SAK=00 UID=04...` and a
+  blue LED. That proves the field, REQA, anticollision and SELECT.
+- Before commissioning, an ISO-DEP card or phone gives
+  `NFC-A ISO-DEP activated ...` and the ATS line, then nothing else,
+  because no Aliro reader is configured and ECP is off.
+- After Apple Home has configured the reader, an iPhone with the Home
+  Key should wake Wallet on approach (ECP), then show
+  `APDU TX` / `APDU RX` lines and
+  `Aliro: Aliro NFC transaction completed successfully in N ms`, green
+  LED, lock state toggles.
 
 ## Artifacts
 

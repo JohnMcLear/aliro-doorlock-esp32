@@ -1,0 +1,276 @@
+# c6-steval-thread boot log, 2026-09-15
+# Firmware: scripts/build_release.sh --variant c6-steval-thread at aliro-doorlock-esp32 8cc1c52
+# Board: ESP32-C6 v0.2 devkit on /dev/ttyACM0 + STEVAL-MB17149B (ST25R3916B) over SPI. No tag or phone near the antenna.
+# Capture 1: first boot after esptool erase_flash + write_flash, 75 s.
+# Capture 2: the next reset (RTS), 75 s.
+
+===== capture 1: first boot after erase =====
+ESP-ROM:esp32c6-20220919
+Build:Sep 19 2022
+rst:0x15 (USB_UART_HPSYS),boot:0xc (SPI_FAST_FLASH_BOOT)
+Saved PC:0x40017600
+SPIWP:0xee
+mode:DIO, clock div:2
+load:0x40875730,len:0x1260
+load:0x4086b910,len:0xe14
+load:0x4086e610,len:0x2e28
+entry 0x4086b91a
+I (23) boot: ESP-IDF v5.5.4 2nd stage bootloader
+I (23) boot: compile time Sep 15 2026 10:32:59
+I (23) boot: chip revision: v0.2
+I (24) boot: efuse block revision: v0.3
+I (24) boot.esp32c6: SPI Speed      : 80MHz
+I (24) boot.esp32c6: SPI Mode       : DIO
+I (24) boot.esp32c6: SPI Flash Size : 4MB
+I (25) boot: Enabling RNG early entropy source...
+I (25) boot: Partition Table:
+I (25) boot: ## Label            Usage          Type ST Offset   Length
+I (26) boot:  0 esp_secure_cert  unknown          3f 06 0000d000 00002000
+I (26) boot:  1 nvs              WiFi data        01 02 00010000 0000c000
+I (27) boot:  2 nvs_keys         NVS keys         01 04 0001c000 00001000
+I (27) boot:  3 otadata          OTA data         01 00 0001d000 00002000
+I (28) boot:  4 phy_init         RF data          01 01 0001f000 00001000
+I (28) boot:  5 ota_0            OTA app          00 10 00020000 001e0000
+I (29) boot:  6 ota_1            OTA app          00 11 00200000 001e0000
+I (29) boot:  7 fctry            WiFi data        01 02 003e0000 00006000
+I (30) boot:  8 coredump         Unknown data     01 03 003e6000 00010000
+I (31) boot: End of partition table
+I (31) boot: No factory image, trying OTA 0
+I (31) esp_image: segment 0: paddr=00020020 vaddr=42140020 size=30ea4h (200356) map
+I (70) esp_image: segment 1: paddr=00050ecc vaddr=40800000 size=0f14ch ( 61772) load
+I (83) esp_image: segment 2: paddr=00060020 vaddr=42000020 size=131bc0h (1252288) map
+I (319) esp_image: segment 3: paddr=00191be8 vaddr=4080f14c size=07998h ( 31128) load
+I (326) esp_image: segment 4: paddr=00199588 vaddr=40816af0 size=02458h (  9304) load
+I (334) boot: Loaded app from partition at offset 0x20000
+I (338) boot: Set actual ota_seq=1 in otadata[0]
+I (338) boot: Disabling RNG early entropy source...
+I (339) cpu_start: Unicore app
+I (348) cpu_start: Pro cpu start user code
+I (348) cpu_start: cpu freq: 160000000 Hz
+I (348) app_init: Application information:
+I (348) app_init: Project name:     aliro-c6-steval-thread
+I (348) app_init: App version:      0.0.5-devkit
+I (349) app_init: Compile time:     Sep 15 2026 10:32:56
+I (349) app_init: ELF file SHA256:  d31a41a70...
+I (349) app_init: ESP-IDF:          v5.5.4
+I (349) efuse_init: Min chip rev:     v0.0
+I (350) efuse_init: Max chip rev:     v0.99 
+I (350) efuse_init: Chip rev:         v0.2
+I (350) heap_init: Initializing. RAM available for dynamic allocation:
+I (350) heap_init: At 4082EF80 len 0004D690 (309 KiB): RAM
+I (351) heap_init: At 4087C610 len 00002F54 (11 KiB): RAM
+I (351) heap_init: At 50000000 len 00003FE8 (15 KiB): RTCRAM
+I (352) spi_flash: detected chip: generic
+I (352) spi_flash: flash io: dio
+I (354) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (354) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (355) main_task: Started on CPU0
+I (355) main_task: Calling app_main()
+I (375) Aliro: c6-steval RGB status LED initialized on GPIO 8
+I (375) st25r3916: ST25R3916 SPI reader: host 1 SCLK=19 MISO=10 MOSI=18 CS=6 IRQ=7 at 1000000 Hz
+I (375) st25r3916: ST25R3916B identified over SPI: IC_IDENTITY=0x31 (type 0x30, revision 1)
+I (385) st25r3916: oscillator stable; IRQ line on GPIO 7 verified
+I (385) st25r3916: VDD 4984 mV, 5 V supply mode
+I (395) st25r3916: antenna tuning: ANT_TUNE_A=0x80 ANT_TUNE_B=0x40 amplitude=115
+I (395) st25r3916: RF field on: collision avoidance APON received, OP_CONTROL=0xcb amplitude=105
+I (395) st25r3916: NFC-A poller ready: 106 kbit/s, RX_CONF3=0x00, FSDI=8, SPI 1000000 Hz
+E (405) persistent_storage: get(62): Failed to get bytes
+E (405) Aliro: Init(589): Failed to get reader group id
+I (405) app_main: Door lock created with endpoint_id 1
+I (415) chip[DL]: NVS set: chip-counters/reboot-count = 1 (0x1)
+I (415) chip[DL]: NVS set: chip-config/unique-id = "C5F994E86CD7B5CB"
+I (415) BLE_INIT: Using main XTAL as clock source, chip ver: 2
+I (415) BLE_INIT: ble controller commit:[bc223ab]
+I (425) OPENTHREAD: Host connection mode none
+I (425) phy_init: phy_version 343,b513b46,Nov 14 2025,16:34:12
+W (425) phy_init: failed to load RF calibration data (0x1102), falling back to full calibration
+I (435) BLE_INIT: Bluetooth MAC: 98:a3:16:9d:8e:52
+I (505) phy_init: Saving new calibration data due to checksum failure or outdated calibration data, mode(2)
+I (515) phy: libbtbb version: c493933, Nov 14 2025, 16:34:25
+I (525) OPENTHREAD: OpenThread attached to netif
+I (535) NimBLE: GAP procedure initiated: stop advertising.
+
+I (535) CHIP[DL]: BLE host-controller synced
+I (535) chip[DL]: OpenThread started: OK
+I (535) chip[DL]: Setting OpenThread device type to MINIMAL END DEVICE
+I (1035) chip[SVR]: Initializing session resumption storage...
+I (1035) chip[SVR]: Initializing subscription resumption storage...
+I (1035) chip[SVR]: Server initializing...
+I (1035) chip[TS]: Last Known Good Time: [unknown]
+I (1035) chip[TS]: Setting Last Known Good Time to firmware build time 2023-10-14T01:16:48
+I (1035) chip[DMG]: AccessControl: initializing
+I (1035) chip[DMG]: Examples::AccessControlDelegate::Init
+I (1035) chip[DMG]: AccessControl: setting
+I (1035) chip[DMG]: DefaultAclStorage: initializing
+I (1035) chip[DMG]: DefaultAclStorage: 0 entries loaded
+I (1035) chip[SVR]: WARNING: mTestEventTriggerDelegate is null
+I (1045) chip[ZCL]: Door Lock server initialized
+I (1045) chip[ZCL]: Door Lock cluster initialized at endpoint #1
+I (1045) chip[DMG]: AccessControlCluster: initializing
+I (1045) chip[DIS]: Updating services using commissioning mode 1
+E (1045) chip[DIS]: Failed to remove advertised services: 3
+I (1045) chip[DIS]: Advertise commission parameter vendorID=65521 productID=32768 discriminator=3840/15 cm=1 cp=0 jf=0
+E (1045) chip[DIS]: Failed to advertise commissionable node: 3
+E (1055) chip[DIS]: Failed to finalize service update: 3
+I (1055) chip[IN]: CASE Server enabling CASE session setups
+I (1055) chip[SVR]: Joining Multicast groups
+I (1055) chip[SVR]: Server Listening...
+I (1055) data_model: Cannot find minimum unused endpoint_id, try to find in the previous namespace
+I (1055) data_model: Failed to open node namespace
+I (1055) chip[DL]: Configuring CHIPoBLE advertising (interval 25 ms, connectable)
+I (1055) NimBLE: GAP procedure initiated: advertise; 
+I (1055) NimBLE: disc_mode=2
+I (1055) NimBLE:  adv_channel_map=0 own_addr_type=1 adv_filter_policy=0 adv_itvl_min=40 adv_itvl_max=40
+I (1055) NimBLE: 
+
+I (1055) chip[DL]: CHIPoBLE advertising started
+I (1055) app_main: Commissioning window opened
+I (1065) chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]
+I (1065) chip[SVR]: Copy/paste the below URL in a browser to see the QR Code:
+I (1065) chip[SVR]: https://project-chip.github.io/connectedhomeip/qrcode.html?data=MT%3AY.K9042C00KA0648G00
+I (1065) chip[SVR]: Manual pairing code: [34970112332]
+I (1065) doorlock_callback: doorlock example init
+ALIRO/1 STATUS firmware=0.0.5-devkit protocol=1 auto_relock_seconds=5 success_rgb=00FF00 failure_rgb=FF0000 other_rgb=0000FF success_ms=1000 failure_ms=1000 other_ms=1000 variant=c6-steval-thread transport=thread
+I (1065) main_task: Returned from app_main()
+I (31045) chip[DL]: bleAdv Timeout : Start slow advertisement
+I (31045) chip[DL]: Configuring CHIPoBLE advertising (interval 500 ms, connectable)
+I (31055) chip[DL]: Device already advertising, stop active advertisement and restart
+I (31055) NimBLE: GAP procedure initiated: stop advertising.
+
+I (31055) NimBLE: GAP procedure initiated: advertise; 
+I (31055) NimBLE: disc_mode=2
+I (31055) NimBLE:  adv_channel_map=0 own_addr_type=1 adv_filter_policy=0 adv_itvl_min=800 adv_itvl_max=800
+I (31055) NimBLE: 
+
+
+===== capture 2: second boot =====
+ESP-ROM:esp32c6-20220919
+Build:Sep 19 2022
+rst:0x15 (USB_UART_HPSYS),boot:0xc (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4080bc20
+SPIWP:0xee
+mode:DIO, clock div:2
+load:0x40875730,len:0x1260
+load:0x4086b910,len:0xe14
+load:0x4086e610,len:0x2e28
+entry 0x4086b91a
+I (23) boot: ESP-IDF v5.5.4 2nd stage bootloader
+I (23) boot: compile time Sep 15 2026 10:32:59
+I (23) boot: chip revision: v0.2
+I (24) boot: efuse block revision: v0.3
+I (24) boot.esp32c6: SPI Speed      : 80MHz
+I (24) boot.esp32c6: SPI Mode       : DIO
+I (24) boot.esp32c6: SPI Flash Size : 4MB
+I (25) boot: Enabling RNG early entropy source...
+I (25) boot: Partition Table:
+I (25) boot: ## Label            Usage          Type ST Offset   Length
+I (26) boot:  0 esp_secure_cert  unknown          3f 06 0000d000 00002000
+I (26) boot:  1 nvs              WiFi data        01 02 00010000 0000c000
+I (27) boot:  2 nvs_keys         NVS keys         01 04 0001c000 00001000
+I (27) boot:  3 otadata          OTA data         01 00 0001d000 00002000
+I (28) boot:  4 phy_init         RF data          01 01 0001f000 00001000
+I (28) boot:  5 ota_0            OTA app          00 10 00020000 001e0000
+I (29) boot:  6 ota_1            OTA app          00 11 00200000 001e0000
+I (29) boot:  7 fctry            WiFi data        01 02 003e0000 00006000
+I (30) boot:  8 coredump         Unknown data     01 03 003e6000 00010000
+I (30) boot: End of partition table
+I (31) esp_image: segment 0: paddr=00020020 vaddr=42140020 size=30ea4h (200356) map
+I (69) esp_image: segment 1: paddr=00050ecc vaddr=40800000 size=0f14ch ( 61772) load
+I (83) esp_image: segment 2: paddr=00060020 vaddr=42000020 size=131bc0h (1252288) map
+I (319) esp_image: segment 3: paddr=00191be8 vaddr=4080f14c size=07998h ( 31128) load
+I (326) esp_image: segment 4: paddr=00199588 vaddr=40816af0 size=02458h (  9304) load
+I (334) boot: Loaded app from partition at offset 0x20000
+I (334) boot: Disabling RNG early entropy source...
+I (335) cpu_start: Unicore app
+I (344) cpu_start: Pro cpu start user code
+I (344) cpu_start: cpu freq: 160000000 Hz
+I (344) app_init: Application information:
+I (344) app_init: Project name:     aliro-c6-steval-thread
+I (344) app_init: App version:      0.0.5-devkit
+I (345) app_init: Compile time:     Sep 15 2026 10:32:56
+I (345) app_init: ELF file SHA256:  d31a41a70...
+I (345) app_init: ESP-IDF:          v5.5.4
+I (345) efuse_init: Min chip rev:     v0.0
+I (345) efuse_init: Max chip rev:     v0.99 
+I (346) efuse_init: Chip rev:         v0.2
+I (346) heap_init: Initializing. RAM available for dynamic allocation:
+I (346) heap_init: At 4082EF80 len 0004D690 (309 KiB): RAM
+I (346) heap_init: At 4087C610 len 00002F54 (11 KiB): RAM
+I (347) heap_init: At 50000000 len 00003FE8 (15 KiB): RTCRAM
+I (348) spi_flash: detected chip: generic
+I (348) spi_flash: flash io: dio
+I (350) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (350) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (351) main_task: Started on CPU0
+I (351) main_task: Calling app_main()
+I (371) Aliro: c6-steval RGB status LED initialized on GPIO 8
+I (371) st25r3916: ST25R3916 SPI reader: host 1 SCLK=19 MISO=10 MOSI=18 CS=6 IRQ=7 at 1000000 Hz
+I (371) st25r3916: ST25R3916B identified over SPI: IC_IDENTITY=0x31 (type 0x30, revision 1)
+I (381) st25r3916: oscillator stable; IRQ line on GPIO 7 verified
+I (381) st25r3916: VDD 4961 mV, 5 V supply mode
+I (391) st25r3916: antenna tuning: ANT_TUNE_A=0x80 ANT_TUNE_B=0x40 amplitude=115
+I (391) st25r3916: RF field on: collision avoidance APON received, OP_CONTROL=0xcb amplitude=105
+I (391) st25r3916: NFC-A poller ready: 106 kbit/s, RX_CONF3=0x00, FSDI=8, SPI 1000000 Hz
+E (391) persistent_storage: get(62): Failed to get bytes
+I (401) Aliro: Aliro Reader is not configured
+I (401) app_main: Door lock created with endpoint_id 1
+I (421) chip[DL]: NVS set: chip-counters/reboot-count = 2 (0x2)
+I (421) BLE_INIT: Using main XTAL as clock source, chip ver: 2
+I (421) BLE_INIT: ble controller commit:[bc223ab]
+I (421) BLE_INIT: Bluetooth MAC: 98:a3:16:9d:8e:52
+I (421) phy_init: phy_version 343,b513b46,Nov 14 2025,16:34:12
+I (431) OPENTHREAD: Host connection mode none
+I (511) phy: libbtbb version: c493933, Nov 14 2025, 16:34:25
+I (521) NimBLE: GAP procedure initiated: stop advertising.
+
+I (521) CHIP[DL]: BLE host-controller synced
+I (531) OPENTHREAD: OpenThread attached to netif
+I (531) chip[DL]: OpenThread started: OK
+I (531) chip[DL]: Setting OpenThread device type to MINIMAL END DEVICE
+I (1031) chip[SVR]: Initializing session resumption storage...
+I (1031) chip[SVR]: Initializing subscription resumption storage...
+I (1031) chip[SVR]: Server initializing...
+I (1031) chip[TS]: Last Known Good Time: 2023-10-14T01:16:48
+I (1031) chip[DMG]: AccessControl: initializing
+I (1031) chip[DMG]: Examples::AccessControlDelegate::Init
+I (1031) chip[DMG]: AccessControl: setting
+I (1031) chip[DMG]: DefaultAclStorage: initializing
+I (1031) chip[DMG]: DefaultAclStorage: 0 entries loaded
+I (1031) chip[SVR]: WARNING: mTestEventTriggerDelegate is null
+I (1041) chip[ZCL]: Door Lock server initialized
+I (1041) chip[ZCL]: Door Lock cluster initialized at endpoint #1
+I (1051) chip[DMG]: AccessControlCluster: initializing
+I (1051) chip[DIS]: Updating services using commissioning mode 1
+E (1051) chip[DIS]: Failed to remove advertised services: 3
+I (1051) chip[DIS]: Advertise commission parameter vendorID=65521 productID=32768 discriminator=3840/15 cm=1 cp=0 jf=0
+E (1051) chip[DIS]: Failed to advertise commissionable node: 3
+E (1051) chip[DIS]: Failed to finalize service update: 3
+I (1051) chip[IN]: CASE Server enabling CASE session setups
+I (1051) chip[SVR]: Joining Multicast groups
+I (1051) chip[SVR]: Server Listening...
+I (1051) chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]
+I (1051) chip[SVR]: Copy/paste the below URL in a browser to see the QR Code:
+I (1051) chip[SVR]: https://project-chip.github.io/connectedhomeip/qrcode.html?data=MT%3AY.K9042C00KA0648G00
+I (1051) chip[SVR]: I (1061) chip[DL]: Configuring CHIPoBLE advertising (interval 25 ms, connectable)
+I (1061) NimBLE: GAP procedure initiated: advertise; 
+I (1061) NimBLE: disc_mode=2
+I (1061) NimBLE:  adv_channel_map=0 own_addr_type=1 adv_filter_policy=0 adv_itvl_min=40 adv_itvl_max=40
+I (1061) NimBLE: 
+
+Manual pairing code: [34970112332]
+I (1061) doorlock_callback: doorlock example init
+ALIRO/1 STATUS firmware=0.0.5-devkit protocol=1 auto_relock_seconds=5 success_rgb=00FF00 failure_rgb=FF0000 other_rgb=0000FF success_ms=1000 failure_ms=1000 other_ms=1000 variant=c6-steval-thread transport=thread
+I (1061) main_task: Returned from app_main()
+I (1061) chip[DL]: CHIPoBLE advertising started
+I (1061) app_main: Commissioning window opened
+I (30401) st25r3916: NFC poller running: polls=300 tags=0 iso_dep=0 rx_errors=0 apdu_failures=0 reinits=0 spi_errors=0 irq_edges=628 amplitude=104
+I (31051) chip[DL]: bleAdv Timeout : Start slow advertisement
+I (31051) chip[DL]: Configuring CHIPoBLE advertising (interval 500 ms, connectable)
+I (31051) chip[DL]: Device already advertising, stop active advertisement and restart
+I (31051) NimBLE: GAP procedure initiated: stop advertising.
+
+I (31051) NimBLE: GAP procedure initiated: advertise; 
+I (31051) NimBLE: disc_mode=2
+I (31051) NimBLE:  adv_channel_map=0 own_addr_type=1 adv_filter_policy=0 adv_itvl_min=800 adv_itvl_max=800
+I (31051) NimBLE: 
+
