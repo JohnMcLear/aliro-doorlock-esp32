@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 using namespace st25r3916;
 
@@ -225,6 +226,456 @@ void test_next_anticollision_prefix()
     EXPECT_EQ(next_anticollision_prefix(0xF0, any).valid, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Multi-tag enumeration
+//
+// The tests below drive enumerate_tags() against a simulated population of
+// PICCs that behaves the way the bench does:
+//
+//  - the FIFO answer starts at the frame byte the prefix ended in, with the
+//    bits the reader transmitted cleared, so the split byte has to be merged
+//    back (Yondoor bug 1);
+//  - COLLISION_STATUS is an absolute frame position, byte 2 being the first UID
+//    byte, so no offset correction is needed here (Yondoor bug 2: the ESPHome
+//    driver subtracts 16 bits because its buffer is UID-relative, this one's
+//    is not);
+//  - bits at and above the collision come back as garbage, so the walk must
+//    keep only the bits below it;
+//  - a PICC that does not match an anticollision prefix, or a SELECT, parks
+//    itself in HALT and answers WUPA only, never REQA (Yondoor bug 3);
+//  - a PICC in ACTIVE ignores WUPA until it has been halted.
+// ---------------------------------------------------------------------------
+
+struct SimTag {
+    uint8_t uid[10] = {};
+    uint8_t uid_len = 0;
+    uint8_t sak = 0;
+    uint8_t bad_bcc = 0;  // XOR into the BCC of the last cascade level
+    enum State : uint8_t { kIdle, kReady, kActive, kHalt } state = kIdle;
+    uint8_t level = 0;
+
+    uint8_t levels() const { return uid_len == 4 ? 1 : (uid_len == 7 ? 2 : 3); }
+
+    // The 4 UID bytes plus BCC this PICC answers with at cascade level `l`.
+    void part(uint8_t l, uint8_t out[5]) const
+    {
+        const uint8_t n = levels();
+        if (l + 1 < n) {
+            out[0] = 0x88;
+            out[1] = uid[l * 3 + 0];
+            out[2] = uid[l * 3 + 1];
+            out[3] = uid[l * 3 + 2];
+        } else {
+            const uint8_t base = static_cast<uint8_t>(l * 3);
+            out[0] = uid[base + 0];
+            out[1] = uid[base + 1];
+            out[2] = uid[base + 2];
+            out[3] = uid[base + 3];
+        }
+        out[4] = static_cast<uint8_t>(out[0] ^ out[1] ^ out[2] ^ out[3]);
+        if (l + 1 == n) {
+            out[4] = static_cast<uint8_t>(out[4] ^ bad_bcc);
+        }
+    }
+};
+
+struct SimField {
+    SimTag tags[8];
+    uint8_t tag_count = 0;
+    unsigned wupa_calls = 0;
+    unsigned anticol_calls = 0;
+    unsigned select_calls = 0;
+    unsigned halt_calls = 0;
+
+    void add(const char *uid_hex, uint8_t sak, uint8_t bad_bcc = 0)
+    {
+        SimTag &t = tags[tag_count++];
+        uint8_t len = 0;
+        for (const char *p = uid_hex; p[0] && p[1]; p += 2) {
+            unsigned byte = 0;
+            std::sscanf(p, "%2x", &byte);
+            t.uid[len++] = static_cast<uint8_t>(byte);
+        }
+        t.uid_len = len;
+        t.sak = sak;
+        t.bad_bcc = bad_bcc;
+    }
+
+    bool wupa()
+    {
+        ++wupa_calls;
+        bool any = false;
+        for (uint8_t i = 0; i < tag_count; ++i) {
+            SimTag &t = tags[i];
+            if (t.state == SimTag::kIdle || t.state == SimTag::kHalt || t.state == SimTag::kReady) {
+                t.state = SimTag::kReady;
+                t.level = 0;
+                any = true;
+            }
+        }
+        return any;
+    }
+
+    void begin_anticollision(uint8_t) {}
+    void end_anticollision(uint8_t) {}
+
+    static bool matches(const uint8_t part[5], const uint8_t *frame, uint8_t bytes, uint8_t bits)
+    {
+        for (uint8_t i = 2; i < bytes; ++i) {
+            if (part[i - 2] != frame[i]) {
+                return false;
+            }
+        }
+        if (bits != 0) {
+            const uint8_t mask = static_cast<uint8_t>((1u << bits) - 1u);
+            if ((part[bytes - 2] & mask) != (frame[bytes] & mask)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    AnticolReply anticollision(uint8_t level, uint8_t *frame, uint8_t bytes, uint8_t bits)
+    {
+        ++anticol_calls;
+        AnticolReply reply;
+        uint8_t parts[8][5] = {};
+        uint8_t responders = 0;
+        for (uint8_t i = 0; i < tag_count; ++i) {
+            SimTag &t = tags[i];
+            if (t.state != SimTag::kReady || t.level != level) {
+                continue;
+            }
+            uint8_t part[5] = {};
+            t.part(level, part);
+            if (!matches(part, frame, bytes, bits)) {
+                t.state = SimTag::kHalt;  // Mifare Classic parks in HALT, not IDLE
+                continue;
+            }
+            std::memcpy(parts[responders++], part, 5);
+        }
+        if (responders == 0) {
+            reply.outcome = AnticolOutcome::kFailed;
+            return reply;
+        }
+
+        // First bit position, LSB first within a byte, where the answers differ.
+        int c_byte = -1;
+        int c_bit = -1;
+        for (uint8_t b = bytes; b < 7 && c_byte < 0; ++b) {
+            for (uint8_t bit = (b == bytes ? bits : 0); bit < 8; ++bit) {
+                const uint8_t value = static_cast<uint8_t>((parts[0][b - 2] >> bit) & 1);
+                for (uint8_t r = 1; r < responders; ++r) {
+                    if (((parts[r][b - 2] >> bit) & 1) != value) {
+                        c_byte = b;
+                        c_bit = bit;
+                        break;
+                    }
+                }
+                if (c_byte >= 0) {
+                    break;
+                }
+            }
+        }
+
+        if (c_byte < 0) {
+            for (uint8_t i = bytes; i < 7; ++i) {
+                frame[i] = parts[0][i - 2];
+            }
+            if (bits != 0) {
+                frame[bytes] = static_cast<uint8_t>(frame[bytes] & ~((1u << bits) - 1u));
+            }
+            reply.outcome = AnticolOutcome::kResolved;
+            reply.rx_len = static_cast<uint8_t>(7 - bytes);
+            return reply;
+        }
+
+        // Garbage at and above the collision, the agreed bits below it, and the
+        // bits we transmitted ourselves cleared.
+        for (uint8_t i = bytes; i < 7; ++i) {
+            frame[i] = 0xFF;
+        }
+        for (uint8_t b = bytes; b <= static_cast<uint8_t>(c_byte); ++b) {
+            const uint8_t first = (b == bytes) ? bits : 0;
+            const uint8_t last = (b == c_byte) ? static_cast<uint8_t>(c_bit) : 8;
+            for (uint8_t bit = first; bit < last; ++bit) {
+                const uint8_t value = static_cast<uint8_t>((parts[0][b - 2] >> bit) & 1);
+                frame[b] = static_cast<uint8_t>((frame[b] & ~(1u << bit)) | (value << bit));
+            }
+        }
+        if (bits != 0) {
+            frame[bytes] = static_cast<uint8_t>(frame[bytes] & ~((1u << bits) - 1u));
+        }
+        reply.outcome = AnticolOutcome::kCollision;
+        reply.collision_status = static_cast<uint8_t>((c_byte << 4) | (c_bit << 1));
+        return reply;
+    }
+
+    bool select(uint8_t level, uint8_t *frame, uint8_t &sak)
+    {
+        ++select_calls;
+        bool matched = false;
+        for (uint8_t i = 0; i < tag_count; ++i) {
+            SimTag &t = tags[i];
+            if (t.state != SimTag::kReady || t.level != level) {
+                continue;
+            }
+            uint8_t part[5] = {};
+            t.part(level, part);
+            if (std::memcmp(part, frame + 2, 5) != 0) {
+                t.state = SimTag::kHalt;
+                continue;
+            }
+            if (level + 1 < t.levels()) {
+                t.level = static_cast<uint8_t>(level + 1);
+                sak = 0x04;
+            } else {
+                t.state = SimTag::kActive;
+                sak = t.sak;
+            }
+            matched = true;
+        }
+        return matched;
+    }
+
+    void halt()
+    {
+        ++halt_calls;
+        for (uint8_t i = 0; i < tag_count; ++i) {
+            if (tags[i].state != SimTag::kIdle) {
+                tags[i].state = SimTag::kHalt;
+            }
+        }
+    }
+};
+
+bool uid_is(const EnumeratedTag &tag, const char *hex)
+{
+    char text[2 * 10 + 1] = {};
+    for (uint8_t i = 0; i < tag.uid_len; ++i) {
+        std::snprintf(text + 2 * i, sizeof(text) - 2 * i, "%02X", tag.uid[i]);
+    }
+    return std::strcmp(text, hex) == 0;
+}
+
+bool found(const EnumeratedTag *tags, uint8_t count, const char *hex)
+{
+    for (uint8_t i = 0; i < count; ++i) {
+        if (uid_is(tags[i], hex)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void test_enumerate_single_tag_costs_nothing_extra()
+{
+    // The single-tag case has to be the frame sequence the driver already sent:
+    // the caller's poll, one anticollision, one SELECT. No extra WUPA, no HLTA.
+    SimField field;
+    field.add("DEA30D00", 0x08);
+    field.wupa();  // the caller's poll
+    field.wupa_calls = 0;
+
+    EnumeratedTag tags[4] = {};
+    EnumerationStats stats;
+    const uint8_t count = enumerate_tags(field, tags, 4, stats);
+    EXPECT_EQ(count, 1);
+    EXPECT_EQ(uid_is(tags[0], "DEA30D00"), true);
+    EXPECT_EQ(tags[0].uid_len, 4);
+    EXPECT_EQ(tags[0].sak, 0x08);
+    EXPECT_EQ(tag_is_iso_dep(tags[0]), false);
+    EXPECT_EQ(stats.rounds, 1);
+    EXPECT_EQ(stats.collisions, 0);
+    EXPECT_EQ(field.wupa_calls, 0);
+    EXPECT_EQ(field.anticol_calls, 1);
+    EXPECT_EQ(field.select_calls, 1);
+    EXPECT_EQ(field.halt_calls, 0);
+}
+
+void test_enumerate_seven_byte_uid_needs_cl2()
+{
+    SimField field;
+    field.add("041AA7675F6180", 0x00);
+    field.wupa();
+    field.wupa_calls = 0;
+
+    EnumeratedTag tags[4] = {};
+    EnumerationStats stats;
+    const uint8_t count = enumerate_tags(field, tags, 4, stats);
+    EXPECT_EQ(count, 1);
+    EXPECT_EQ(tags[0].uid_len, 7);
+    EXPECT_EQ(uid_is(tags[0], "041AA7675F6180"), true);
+    EXPECT_EQ(stats.rounds, 1);
+    EXPECT_EQ(stats.collisions, 0);
+    EXPECT_EQ(field.anticol_calls, 2);  // CL1 and CL2
+    EXPECT_EQ(field.select_calls, 2);
+    EXPECT_EQ(field.halt_calls, 0);
+}
+
+void test_enumerate_two_tags_colliding_at_cl1()
+{
+    // Two 4-byte UIDs that differ in the first UID byte.
+    SimField field;
+    field.add("DEA30D00", 0x08);
+    field.add("DFA30D00", 0x20);
+    field.wupa();
+    field.wupa_calls = 0;
+
+    EnumeratedTag tags[4] = {};
+    EnumerationStats stats;
+    const uint8_t count = enumerate_tags(field, tags, 4, stats);
+    EXPECT_EQ(count, 2);
+    EXPECT_EQ(found(tags, count, "DEA30D00"), true);
+    EXPECT_EQ(found(tags, count, "DFA30D00"), true);
+    EXPECT_EQ(stats.rounds, 2);
+    EXPECT_EQ(stats.collisions, 1);
+    EXPECT_EQ(stats.branches_pushed, 1);
+    EXPECT_EQ(field.wupa_calls, 1);  // one per extra round
+    EXPECT_EQ(field.halt_calls, 1);
+    // The ISO-DEP tag is the one the Aliro exchange wants.
+    for (uint8_t i = 0; i < count; ++i) {
+        EXPECT_EQ(tag_is_iso_dep(tags[i]), uid_is(tags[i], "DFA30D00"));
+    }
+}
+
+void test_enumerate_the_bench_pair()
+{
+    // The two cards on the STEVAL bench. Both are 7-byte UIDs, so both cascade,
+    // and they collide at CL1 in the second UID byte: 0xDB against 0x1A differ
+    // in bit 0, which is COLLISION_STATUS 0x40, frame byte 4 bit 0. The branch
+    // with the 1 is 04DB..., which is the only UID the old single-branch
+    // resolution ever reported.
+    //
+    // This is the case the Yondoor notes call "CL1 collision state must be
+    // saved before CL2": the pending CL1 branch has to survive the whole CL2
+    // excursion for the first card.
+    SimField field;
+    field.add("04DB70605F6180", 0x00);
+    field.add("041AA7675F6180", 0x00);
+    field.wupa();
+    field.wupa_calls = 0;
+
+    EnumeratedTag tags[4] = {};
+    EnumerationStats stats;
+    const uint8_t count = enumerate_tags(field, tags, 4, stats);
+    EXPECT_EQ(count, 2);
+    EXPECT_EQ(uid_is(tags[0], "04DB70605F6180"), true);  // the 1 branch first
+    EXPECT_EQ(uid_is(tags[1], "041AA7675F6180"), true);
+    EXPECT_EQ(stats.rounds, 2);
+    EXPECT_EQ(stats.collisions, 1);
+    EXPECT_EQ(stats.hit_round_cap, false);
+    EXPECT_EQ(stats.hit_tag_cap, false);
+}
+
+void test_enumerate_collision_at_cl2_replays_cl1()
+{
+    // Same manufacturer bytes, so CL1 is identical and the collision is at CL2.
+    // The pending branch is a CL2 branch, and reaching it again means selecting
+    // CL1 first: the branch has to carry the CL1 UID part with it.
+    SimField field;
+    field.add("04DB7011223344", 0x00);
+    field.add("04DB7055667788", 0x00);
+    field.wupa();
+    field.wupa_calls = 0;
+
+    EnumeratedTag tags[4] = {};
+    EnumerationStats stats;
+    const uint8_t count = enumerate_tags(field, tags, 4, stats);
+    EXPECT_EQ(count, 2);
+    EXPECT_EQ(found(tags, count, "04DB7011223344"), true);
+    EXPECT_EQ(found(tags, count, "04DB7055667788"), true);
+    EXPECT_EQ(stats.rounds, 2);
+    EXPECT_EQ(stats.collisions, 1);
+    // Round 2 re-selects CL1 from the branch's saved path, then anticollides at
+    // CL2: two SELECTs in round 1, two in round 2.
+    EXPECT_EQ(field.select_calls, 4);
+}
+
+void test_enumerate_collision_in_the_bcc()
+{
+    // A BCC collision cannot be split: the four UID bytes are already known and
+    // no bit can be driven, so there is no second branch to push. The subtree is
+    // abandoned without hanging, and the other card is still found.
+    SimField field;
+    field.add("DEA30D00", 0x08);
+    field.add("DEA30D00", 0x08, 0x5A);  // same UID, corrupt BCC
+    field.add("5EA30D00", 0x08);
+    field.wupa();
+    field.wupa_calls = 0;
+
+    EnumeratedTag tags[4] = {};
+    EnumerationStats stats;
+    const uint8_t count = enumerate_tags(field, tags, 4, stats);
+    EXPECT_EQ(count, 1);
+    EXPECT_EQ(found(tags, count, "5EA30D00"), true);
+    EXPECT_EQ(stats.hit_round_cap, false);
+    // The BCC collision is at frame byte 6, where next_anticollision_prefix
+    // forces no bit, so it pushes no branch. Only the UID-byte collision does.
+    EXPECT_EQ(stats.branches_pushed, 1);
+    // One collision on the first UID byte, then the BCC collision twice: the
+    // second one does not grow the prefix, so the subtree is given up there.
+    EXPECT_EQ(stats.collisions, 3);
+    EXPECT_EQ(stats.rounds, 2);
+}
+
+void test_enumerate_stops_at_the_cap()
+{
+    SimField field;
+    field.add("01A30D00", 0x08);
+    field.add("03A30D00", 0x08);
+    field.add("05A30D00", 0x08);
+    field.add("07A30D00", 0x08);
+    field.add("09A30D00", 0x08);
+    field.wupa();
+    field.wupa_calls = 0;
+
+    EnumeratedTag tags[4] = {};
+    EnumerationStats stats;
+    const uint8_t count = enumerate_tags(field, tags, 4, stats);
+    EXPECT_EQ(count, 4);
+    EXPECT_EQ(stats.hit_tag_cap, true);
+    EXPECT_EQ(stats.rounds <= kMaxEnumerationRounds, true);
+    // Nothing was written past the caller's buffer.
+    EXPECT_EQ(stats.hit_round_cap, false);
+}
+
+void test_enumerate_empty_field()
+{
+    SimField field;
+    EnumeratedTag tags[4] = {};
+    EnumerationStats stats;
+    EXPECT_EQ(enumerate_tags(field, tags, 4, stats), 0);
+    EXPECT_EQ(stats.rounds, 1);
+}
+
+void test_select_frames_round_trip()
+{
+    uint8_t frames[kCascadeLevels][kAnticollisionFrameSize] = {};
+    const uint8_t uid7[7] = {0x04, 0xDB, 0x70, 0x60, 0x5F, 0x61, 0x80};
+    EXPECT_EQ(build_select_frames(uid7, 7, frames), 2);
+    EXPECT_EQ(frames[0][0], 0x93);
+    EXPECT_EQ(frames[0][1], 0x70);
+    EXPECT_EQ(frames[0][2], 0x88);  // cascade tag
+    EXPECT_EQ(frames[0][3], 0x04);
+    EXPECT_EQ(frames[0][6], 0x88 ^ 0x04 ^ 0xDB ^ 0x70);
+    EXPECT_EQ(frames[1][0], 0x95);
+    EXPECT_EQ(frames[1][2], 0x60);
+    EXPECT_EQ(frames[1][6], 0x60 ^ 0x5F ^ 0x61 ^ 0x80);
+
+    const uint8_t uid4[4] = {0xDE, 0xA3, 0x0D, 0x00};
+    EXPECT_EQ(build_select_frames(uid4, 4, frames), 1);
+    EXPECT_EQ(frames[0][2], 0xDE);
+    EXPECT_EQ(build_select_frames(uid4, 5, frames), 0);
+
+    uint8_t parts[kCascadeLevels][4] = {{0x88, 0x04, 0xDB, 0x70}, {0x60, 0x5F, 0x61, 0x80}, {0, 0, 0, 0}};
+    uint8_t uid[10] = {};
+    EXPECT_EQ(assemble_uid(parts, 2, uid), 7);
+    for (int i = 0; i < 7; ++i) {
+        EXPECT_EQ(uid[i], uid7[i]);
+    }
+}
+
 } // namespace
 
 int main()
@@ -239,6 +690,15 @@ int main()
     test_ecp_frame_bytes();
     test_anticollision_helpers();
     test_next_anticollision_prefix();
+    test_select_frames_round_trip();
+    test_enumerate_single_tag_costs_nothing_extra();
+    test_enumerate_seven_byte_uid_needs_cl2();
+    test_enumerate_two_tags_colliding_at_cl1();
+    test_enumerate_the_bench_pair();
+    test_enumerate_collision_at_cl2_replays_cl1();
+    test_enumerate_collision_in_the_bcc();
+    test_enumerate_stops_at_the_cap();
+    test_enumerate_empty_field();
     if (g_failures != 0) {
         std::printf("st25r3916 frame logic: %d failure(s)\n", g_failures);
         return EXIT_FAILURE;

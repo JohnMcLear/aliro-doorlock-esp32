@@ -63,6 +63,11 @@ constexpr uint32_t kSelectTimeoutMs = 8;
 constexpr uint32_t kRatsTimeoutMs = 10;
 constexpr uint32_t kDeselectTimeoutMs = 8;
 
+// A wallet held against a reader has a handful of tags in it at most, and each
+// extra one costs another WUPA and anticollision round before the lock can
+// answer the tap. Four is the cap; the stats line says when it was hit.
+constexpr uint8_t kMaxTagsPerPoll = 4;
+
 // Mask receive timer after our own transmission, in 64/fc steps. RFAL uses
 // FDT(listen, NFC-A poller) 1172/fc less its 276/fc adjustment: 896/64 = 14.
 constexpr uint8_t kMaskReceiveTimer = 14;
@@ -146,9 +151,16 @@ struct Stats {
     uint32_t apdu_failures = 0;
     uint32_t reinits = 0;
     uint32_t collisions = 0;
+    uint32_t enumerated = 0;       // tags resolved, counting every tag in a poll
+    uint32_t multi_tag_polls = 0;  // polls that resolved more than one tag
+    uint32_t tag_cap_hits = 0;     // polls that stopped at kMaxTagsPerPoll
 } g_stats;
 
 int64_t g_next_collision_log_us = 0;
+
+// Which ISO-DEP candidate to hand the Aliro exchange when a poll finds several.
+// Advanced once per such poll so no single card can hold the reader.
+uint32_t g_iso_dep_rotor = 0;
 
 // ECP state is written from the Matter task and read by the NFC task.
 std::array<uint8_t, kEcpFrameSize> g_aliro_ecp_frame = {
@@ -397,10 +409,11 @@ bool poll_a(uint16_t &atqa)
         status == RxStatus::kFraming || status == RxStatus::kCrc;
 }
 
-// A collision means two or more PICCs answered the same anticollision frame,
-// so the UID this poll ends up reporting is one of several. Say so, throttled,
-// because silently picking a branch looks exactly like a corrupted UID from
-// outside the driver.
+// A collision means two or more PICCs answered the same anticollision frame.
+// The walk now visits both branches, so this is no longer a warning that the
+// UID is one of several; it is the marker for how often a real reader sees two
+// credentials at once. Throttled, because with two cards parked on the antenna
+// every poll collides.
 void report_collision(uint8_t level, uint8_t collision_status)
 {
     const int64_t now = esp_timer_get_time();
@@ -410,27 +423,34 @@ void report_collision(uint8_t level, uint8_t collision_status)
     g_next_collision_log_us = now + kCollisionLogIntervalUs;
     ESP_LOGI(kTag,
              "NFC-A CL%u collision at frame byte %u bit %u (COLLISION_STATUS=0x%02x): more than one tag is in the "
-             "field. Taking the branch with a 1; the UID reported is one of them, not the only one.",
+             "field. Following the 1 branch now and the 0 branch after this tag is halted.",
              level + 1, static_cast<unsigned>((collision_status >> 4) & 0x0F),
              static_cast<unsigned>((collision_status >> 1) & 0x07), collision_status);
 }
 
-// One cascade level of anticollision and SELECT, following
-// rfalNfcaPollerSingleCollisionResolution: on a collision, take the tag that
-// has a 1 at the collision bit.
-bool select_cascade_level(uint8_t level, uint8_t uid_part[4], uint8_t &sak)
-{
-    constexpr uint8_t kSelCmd[3] = {0x93, 0x95, 0x97};
-    uint8_t frame[7] = {kSelCmd[level], 0x00, 0, 0, 0, 0, 0};
-    uint8_t bytes = 2;
-    uint8_t bits = 0;
+// The hardware seam enumerate_tags() drives. Everything above it is the tree
+// walk in st25r3916_frame_logic.h, which the host test covers; everything here
+// is the frame each step puts on the air, unchanged from the single-branch
+// version that was verified on the bench.
+struct PollerOps {
+    bool wupa()
+    {
+        uint16_t atqa = 0;
+        return poll_a(atqa);
+    }
 
-    (void)write_reg(kRegCorrConf1, kCorrConf1Anticollision);
-    bool resolved = false;
-    for (int iteration = 0; iteration < 32; ++iteration) {
-        frame[1] = sel_par(bytes, bits);
-        const uint8_t sent_split = bits ? frame[bytes] : 0;
+    void begin_anticollision(uint8_t)
+    {
+        (void)write_reg(kRegCorrConf1, kCorrConf1Anticollision);
+    }
 
+    void end_anticollision(uint8_t)
+    {
+        (void)write_reg(kRegCorrConf1, kCorrConf1Data);
+    }
+
+    AnticolReply anticollision(uint8_t level, uint8_t *frame, uint8_t bytes, uint8_t bits)
+    {
         TxRxRequest req;
         req.tx = frame;
         req.tx_bytes = bytes;
@@ -440,82 +460,92 @@ bool select_cascade_level(uint8_t level, uint8_t uid_part[4], uint8_t &sak)
         req.antcol = true;
         req.timeout_ms = kAnticollisionTimeoutMs;
         size_t rx_len = 0;
-        const RxStatus status = transceive(req, frame + bytes, sizeof(frame) - bytes, rx_len, nullptr);
-        if (bits) {
-            frame[bytes] = merge_split_byte(frame[bytes], sent_split, bits);
-        }
+        const RxStatus status =
+            transceive(req, frame + bytes, kAnticollisionFrameSize - bytes, rx_len, nullptr);
 
+        AnticolReply reply;
         if (status == RxStatus::kCollision) {
             uint8_t coll = 0;
             if (read_reg(kRegCollisionStatus, coll) != ESP_OK) {
-                break;
-            }
-            const AnticollisionPrefix next = next_anticollision_prefix(coll, frame);
-            if (!next.valid) {
-                ESP_LOGD(kTag, "anticollision: collision position out of range (0x%02x)", coll);
-                break;
+                return reply;  // kFailed
             }
             ++g_stats.collisions;
             report_collision(level, coll);
-            bytes = next.bytes;
-            bits = next.bits;
-            continue;
+            reply.outcome = AnticolOutcome::kCollision;
+            reply.collision_status = coll;
+            return reply;
         }
-        if (status != RxStatus::kOk || bytes + rx_len != sizeof(frame)) {
+        if (status != RxStatus::kOk) {
             ESP_LOGD(kTag, "anticollision CL%u failed: %s rx_len=%u", level + 1, rx_status_name(status),
                      static_cast<unsigned>(rx_len));
-            break;
+            return reply;
         }
-        resolved = true;
-        break;
-    }
-    (void)write_reg(kRegCorrConf1, kCorrConf1Data);
-    if (!resolved) {
-        return false;
-    }
-    if (bcc(frame + 2, 4) != frame[6]) {
-        ESP_LOGD(kTag, "anticollision CL%u: BCC mismatch", level + 1);
-        return false;
+        reply.outcome = AnticolOutcome::kResolved;
+        reply.rx_len = static_cast<uint8_t>(rx_len);
+        return reply;
     }
 
-    frame[1] = 0x70;  // SELECT: 7 whole bytes
-    TxRxRequest req;
-    req.tx = frame;
-    req.tx_bytes = sizeof(frame);
-    req.tx_crc = true;
-    req.rx_crc = true;
-    req.timeout_ms = kSelectTimeoutMs;
-    uint8_t sak_buf[1] = {};
-    size_t sak_len = 0;
-    const RxStatus status = transceive(req, sak_buf, sizeof(sak_buf), sak_len, nullptr);
-    if (status != RxStatus::kOk || sak_len != 1) {
-        ESP_LOGD(kTag, "SELECT CL%u failed: %s len=%u", level + 1, rx_status_name(status),
-                 static_cast<unsigned>(sak_len));
-        return false;
-    }
-    std::memcpy(uid_part, frame + 2, 4);
-    sak = sak_buf[0];
-    return true;
-}
-
-bool select_a(uint8_t *uid, uint8_t &uid_len, uint8_t &sak)
-{
-    uid_len = 0;
-    for (uint8_t level = 0; level < 3; ++level) {
-        uint8_t part[4] = {};
-        if (!select_cascade_level(level, part, sak)) {
+    bool select(uint8_t level, uint8_t *frame, uint8_t &sak)
+    {
+        TxRxRequest req;
+        req.tx = frame;
+        req.tx_bytes = kAnticollisionFrameSize;
+        req.tx_crc = true;
+        req.rx_crc = true;
+        req.timeout_ms = kSelectTimeoutMs;
+        uint8_t sak_buf[1] = {};
+        size_t sak_len = 0;
+        const RxStatus status = transceive(req, sak_buf, sizeof(sak_buf), sak_len, nullptr);
+        if (status != RxStatus::kOk || sak_len != 1) {
+            ESP_LOGD(kTag, "SELECT CL%u failed: %s len=%u", level + 1, rx_status_name(status),
+                     static_cast<unsigned>(sak_len));
             return false;
         }
-        if (sak & 0x04) {  // UID not complete: part[0] is the cascade tag
-            std::memcpy(uid + uid_len, part + 1, 3);
-            uid_len = static_cast<uint8_t>(uid_len + 3);
-            continue;
-        }
-        std::memcpy(uid + uid_len, part, 4);
-        uid_len = static_cast<uint8_t>(uid_len + 4);
+        sak = sak_buf[0];
         return true;
     }
-    return false;
+
+    void halt()
+    {
+        static constexpr uint8_t kHlta[2] = {0x50, 0x00};
+        TxRxRequest req;
+        req.tx = kHlta;
+        req.tx_bytes = sizeof(kHlta);
+        req.expect_response = false;
+        uint8_t rx[1] = {};
+        size_t rx_len = 0;
+        (void)transceive(req, rx, sizeof(rx), rx_len, nullptr);
+        delay_ms(2);
+    }
+};
+
+// Put a PICC whose UID is already known back into the selected state: HLTA the
+// one enumeration left active, WUPA to wake the field, then SELECT straight
+// down the cascade with no anticollision, because there is nothing left to
+// resolve. Used when the tag the Aliro exchange wants is not the last one the
+// walk selected.
+bool reselect_tag(PollerOps &ops, const EnumeratedTag &tag)
+{
+    uint8_t frames[kCascadeLevels][kAnticollisionFrameSize] = {};
+    const uint8_t levels = build_select_frames(tag.uid, tag.uid_len, frames);
+    if (levels == 0) {
+        return false;
+    }
+    ops.halt();
+    if (!ops.wupa()) {
+        return false;
+    }
+    uint8_t sak = 0;
+    for (uint8_t level = 0; level < levels; ++level) {
+        if (!ops.select(level, frames[level], sak)) {
+            return false;
+        }
+        const bool cascade = (sak & kSakCascadeBit) != 0;
+        if (cascade != (level + 1 < levels)) {
+            return false;
+        }
+    }
+    return sak == tag.sak;
 }
 
 const char *format_uid(const uint8_t *uid, uint8_t len, char *out, size_t out_size)
@@ -871,11 +901,13 @@ void log_status(const char *reason)
     uint8_t amplitude = 0;
     measure_field(amplitude);
     ESP_LOGI(kTag,
-             "NFC poller %s: polls=%" PRIu32 " tags=%" PRIu32 " iso_dep=%" PRIu32 " rx_errors=%" PRIu32
-             " collisions=%" PRIu32 " apdu_failures=%" PRIu32 " reinits=%" PRIu32 " spi_errors=%" PRIu32
-             " irq_edges=%" PRIu32 " amplitude=%u",
-             reason, g_stats.polls, g_stats.tags, g_stats.iso_dep, g_stats.rx_errors, g_stats.collisions,
-             g_stats.apdu_failures, g_stats.reinits, spi_error_count(), irq_edge_count(), amplitude);
+             "NFC poller %s: polls=%" PRIu32 " tags=%" PRIu32 " enumerated=%" PRIu32 " multi_tag_polls=%" PRIu32
+             " tag_cap_hits=%" PRIu32 " iso_dep=%" PRIu32 " rx_errors=%" PRIu32 " collisions=%" PRIu32
+             " apdu_failures=%" PRIu32 " reinits=%" PRIu32 " spi_errors=%" PRIu32 " irq_edges=%" PRIu32
+             " amplitude=%u",
+             reason, g_stats.polls, g_stats.tags, g_stats.enumerated, g_stats.multi_tag_polls,
+             g_stats.tag_cap_hits, g_stats.iso_dep, g_stats.rx_errors, g_stats.collisions, g_stats.apdu_failures,
+             g_stats.reinits, spi_error_count(), irq_edge_count(), amplitude);
 }
 
 } // namespace
@@ -961,16 +993,83 @@ m5nfc_activation_result_t m5nfc_activate(void)
         return M5NFC_ACTIVATION_NONE;
     }
 
-    uint8_t uid[10] = {};
-    uint8_t uid_len = 0;
-    uint8_t sak = 0;
-    if (!select_a(uid, uid_len, sak)) {
+    // Enumerate the whole field, not just the first PICC the collision tree
+    // leads to. With one tag this is the frame sequence it always was.
+    PollerOps ops;
+    EnumeratedTag tags[kMaxTagsPerPoll] = {};
+    EnumerationStats enumeration;
+    const uint8_t tag_count = enumerate_tags(ops, tags, kMaxTagsPerPoll, enumeration);
+    if (tag_count == 0) {
         ESP_LOGD(kTag, "ATQA=%04x seen but anticollision/SELECT did not complete", atqa);
         return M5NFC_ACTIVATION_NONE;
     }
-    ++g_stats.tags;
-    char uid_str[2 * sizeof(uid) + 1];
+    g_stats.enumerated += tag_count;
+    char uid_str[2 * kMaxUidBytes + 1];
+
+    if (tag_count > 1) {
+        ++g_stats.multi_tag_polls;
+        if (enumeration.hit_tag_cap) {
+            ++g_stats.tag_cap_hits;
+        }
+        // Every UID found in this poll, in one line, so a wallet full of cards
+        // is visible from the log rather than looking like one flapping UID.
+        char line[kMaxTagsPerPoll * 40] = {};
+        size_t pos = 0;
+        for (uint8_t i = 0; i < tag_count && pos < sizeof(line); ++i) {
+            format_uid(tags[i].uid, tags[i].uid_len, uid_str, sizeof(uid_str));
+            pos += static_cast<size_t>(snprintf(line + pos, sizeof(line) - pos, "%s[%u] UID=%s SAK=%02x",
+                                                i ? " " : "", i, uid_str, tags[i].sak));
+        }
+        ESP_LOGI(kTag, "NFC-A field holds %u tags%s: %s", tag_count,
+                 enumeration.hit_tag_cap ? " (cap reached, there may be more)" : "", line);
+    }
+
+    // The interface hands the door lock one activation, and the only thing it
+    // can do with it is the Aliro APDU exchange, which needs ISO/IEC 14443-4.
+    // So activate an ISO-DEP tag when there is one; a tag without it can never
+    // open this lock whichever one we pick. When several are ISO-DEP, which is
+    // a phone next to a bank card, rotate: picking deterministically would let
+    // whichever card wins the collision bit shut the other one out of every
+    // poll, which is the failure this whole change is about.
+    uint8_t chosen = 0;
+    uint8_t iso_dep_count = 0;
+    for (uint8_t i = 0; i < tag_count; ++i) {
+        if (tag_is_iso_dep(tags[i])) {
+            ++iso_dep_count;
+        }
+    }
+    if (iso_dep_count > 0) {
+        const uint8_t pick =
+            iso_dep_count > 1 ? static_cast<uint8_t>(g_iso_dep_rotor++ % iso_dep_count) : 0;
+        uint8_t seen = 0;
+        for (uint8_t i = 0; i < tag_count; ++i) {
+            if (!tag_is_iso_dep(tags[i])) {
+                continue;
+            }
+            if (seen == pick) {
+                chosen = i;
+                break;
+            }
+            ++seen;
+        }
+    }
+
+    const uint8_t *uid = tags[chosen].uid;
+    const uint8_t uid_len = tags[chosen].uid_len;
+    const uint8_t sak = tags[chosen].sak;
     format_uid(uid, uid_len, uid_str, sizeof(uid_str));
+
+    // enumerate_tags() leaves the last tag it resolved selected. Anything else
+    // has to be selected again before an APDU can go to it.
+    if (chosen + 1 != tag_count) {
+        if (!reselect_tag(ops, tags[chosen])) {
+            ESP_LOGW(kTag, "could not reselect UID=%s out of %u tags in the field", uid_str, tag_count);
+            return M5NFC_ACTIVATION_NONE;
+        }
+        ESP_LOGI(kTag, "selected UID=%s of %u tags for this poll (ISO-DEP candidates: %u)", uid_str, tag_count,
+                 iso_dep_count);
+    }
+    ++g_stats.tags;
 
     if (!(sak & 0x20)) {
         g_active = true;

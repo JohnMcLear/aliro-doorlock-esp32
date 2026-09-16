@@ -208,6 +208,9 @@ inline uint8_t sel_par(uint8_t bytes, uint8_t bits)
 // next round sends them whole and no bit is forced.
 struct AnticollisionPrefix {
     bool valid = false;
+    bool forced = false;       // a colliding bit was driven to 1
+    uint8_t forced_byte = 0;   // frame byte holding that bit
+    uint8_t forced_bit = 0;    // bit index within it
     uint8_t bytes = 0;  // whole bytes of the next frame, SEL and NVB included
     uint8_t bits = 0;   // valid bits of the trailing partial byte, 0 for none
 };
@@ -228,6 +231,9 @@ inline AnticollisionPrefix next_anticollision_prefix(uint8_t collision_status, u
     }
     const uint8_t known = static_cast<uint8_t>((1u << c_bit) - 1u);
     frame[c_byte] = static_cast<uint8_t>((frame[c_byte] & known) | (1u << c_bit));
+    next.forced = true;
+    next.forced_byte = c_byte;
+    next.forced_bit = c_bit;
     if (c_bit == 7) {
         next.bytes = static_cast<uint8_t>(c_byte + 1);
         next.bits = 0;
@@ -236,6 +242,321 @@ inline AnticollisionPrefix next_anticollision_prefix(uint8_t collision_status, u
         next.bits = static_cast<uint8_t>(c_bit + 1);
     }
     return next;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tag enumeration: the full ISO/IEC 14443-3 anticollision tree walk.
+//
+// next_anticollision_prefix() alone is rfalNfcaPollerSingleCollisionResolution:
+// at a collision it takes the branch with a 1 and never comes back for the 0.
+// With two credentials on the reader that resolves the same PICC on every poll
+// and the other one is invisible, which on a door is a card that never works
+// rather than a card that works intermittently.
+//
+// The walk below is the standard depth-first search. Every collision has two
+// branches; we follow the 1 and push the 0 on a stack. When a PICC has been
+// fully selected we HLTA it (so it leaves the ACTIVE state, where it would
+// ignore the next WUPA) and pop a branch. Each round starts with WUPA, not
+// REQA: a PICC that was halted, or that dropped out of the previous round
+// because the prefix did not match it, answers WUPA only (ISO/IEC 14443-3 6.3,
+// and Mifare Classic parks itself in HALT after a SELECT that is not for it).
+// Waking everybody again is harmless because the saved prefix excludes the
+// PICCs already found.
+//
+// A branch pushed at cascade level 2 or 3 also records the UID parts of the
+// levels above it, because the reader has to re-SELECT its way back down to
+// that level before the saved prefix means anything. That is the bug listed in
+// the Yondoor driver's notes as "CL1 collision state must be saved before CL2":
+// here each stack entry carries its own path, so CL2 cannot clobber CL1.
+//
+// Ported from John McLear's ESPHome ST25R3916 driver
+// (esphome_st25r_yondoor/components/st25r/st25r.cpp) and its
+// memory/multitag_anticol.md, with the brute-force prefix counter replaced by
+// an explicit branch stack.
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t kMaxUidBytes = 10;
+constexpr uint8_t kCascadeLevels = 3;
+constexpr uint8_t kAnticollisionFrameSize = 7;  // SEL, NVB, 4 UID bytes, BCC
+constexpr uint8_t kMaxPendingBranches = 8;
+constexpr uint8_t kMaxEnumerationRounds = 12;
+constexpr uint8_t kSelectCommand[kCascadeLevels] = {0x93, 0x95, 0x97};
+constexpr uint8_t kSakCascadeBit = 0x04;     // UID is not complete
+constexpr uint8_t kSakIso144434Bit = 0x20;   // PICC supports ISO/IEC 14443-4
+constexpr uint8_t kCascadeTag = 0x88;
+constexpr uint8_t kNvbComplete = 0x70;       // SELECT: 7 whole bytes
+
+struct EnumeratedTag {
+    uint8_t uid[kMaxUidBytes] = {};
+    uint8_t uid_len = 0;
+    uint8_t sak = 0;
+};
+
+inline bool tag_is_iso_dep(const EnumeratedTag &tag)
+{
+    return (tag.sak & kSakIso144434Bit) != 0;
+}
+
+enum class AnticolOutcome : uint8_t {
+    kResolved,   // a single PICC answered; frame now holds 4 UID bytes and BCC
+    kCollision,  // two or more PICCs answered
+    kFailed,     // timeout, framing error, or a length that cannot be a UID
+};
+
+struct AnticolReply {
+    AnticolOutcome outcome = AnticolOutcome::kFailed;
+    uint8_t rx_len = 0;            // bytes the PICC put at frame + bytes
+    uint8_t collision_status = 0;  // COLLISION_STATUS, only for kCollision
+};
+
+// One anticollision branch that has not been explored yet.
+struct SearchBranch {
+    uint8_t level = 0;                            // cascade level of the branch
+    uint8_t path[kCascadeLevels - 1][4] = {};     // UID parts of the levels above
+    uint8_t frame[kAnticollisionFrameSize] = {};  // partial frame at `level`
+    uint8_t bytes = 2;
+    uint8_t bits = 0;
+};
+
+struct EnumerationStats {
+    uint8_t rounds = 0;
+    uint8_t collisions = 0;
+    uint8_t branches_pushed = 0;
+    bool hit_tag_cap = false;
+    bool hit_branch_cap = false;
+    bool hit_round_cap = false;
+};
+
+// Rebuild the SELECT frames that walk down to a UID already known. Returns the
+// number of cascade levels, or 0 for a length that is not 4, 7 or 10.
+inline uint8_t build_select_frames(const uint8_t *uid, uint8_t uid_len,
+                                   uint8_t frames[kCascadeLevels][kAnticollisionFrameSize])
+{
+    uint8_t levels = 0;
+    if (uid_len == 4) {
+        levels = 1;
+    } else if (uid_len == 7) {
+        levels = 2;
+    } else if (uid_len == 10) {
+        levels = 3;
+    } else {
+        return 0;
+    }
+    uint8_t consumed = 0;
+    for (uint8_t level = 0; level < levels; ++level) {
+        uint8_t part[4] = {};
+        if (level + 1 < levels) {
+            part[0] = kCascadeTag;
+            std::memcpy(part + 1, uid + consumed, 3);
+            consumed = static_cast<uint8_t>(consumed + 3);
+        } else {
+            std::memcpy(part, uid + consumed, 4);
+            consumed = static_cast<uint8_t>(consumed + 4);
+        }
+        frames[level][0] = kSelectCommand[level];
+        frames[level][1] = kNvbComplete;
+        std::memcpy(frames[level] + 2, part, 4);
+        frames[level][6] = bcc(part, 4);
+    }
+    return levels;
+}
+
+// The cascade tag is not part of the UID: each incomplete level contributes its
+// last three bytes, the final level all four.
+inline uint8_t assemble_uid(const uint8_t parts[kCascadeLevels][4], uint8_t levels, uint8_t *uid)
+{
+    uint8_t len = 0;
+    for (uint8_t level = 0; level < levels; ++level) {
+        if (level + 1 < levels) {
+            std::memcpy(uid + len, parts[level] + 1, 3);
+            len = static_cast<uint8_t>(len + 3);
+        } else {
+            std::memcpy(uid + len, parts[level], 4);
+            len = static_cast<uint8_t>(len + 4);
+        }
+    }
+    return len;
+}
+
+// Anticollision at one cascade level, starting from the prefix in
+// frame/bytes/bits. Every collision on the way pushes its 0 branch.
+//
+// `Ops` is the hardware seam, so the walk can be tested on the host:
+//   bool       wupa();
+//   void       begin_anticollision(uint8_t level);
+//   void       end_anticollision(uint8_t level);
+//   AnticolReply anticollision(uint8_t level, uint8_t *frame, uint8_t bytes, uint8_t bits);
+//   bool       select(uint8_t level, uint8_t *frame, uint8_t &sak);
+//   void       halt();
+template <typename Ops>
+bool resolve_anticollision_level(Ops &ops, uint8_t level, uint8_t *frame, uint8_t &bytes, uint8_t &bits,
+                                 const uint8_t path[kCascadeLevels][4], SearchBranch *pending,
+                                 uint8_t &pending_count, EnumerationStats &stats)
+{
+    ops.begin_anticollision(level);
+    bool resolved = false;
+    uint8_t previous_bytes = 0;
+    uint8_t previous_bits = 0;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        if (iteration > 0 && bytes == previous_bytes && bits == previous_bits) {
+            // The prefix did not grow, so the same frame would go out again.
+            // Only a BCC collision does this, and it cannot be split: two PICCs
+            // are claiming the same four UID bytes. Give the subtree up rather
+            // than spending 32 anticollision timeouts on it.
+            break;
+        }
+        previous_bytes = bytes;
+        previous_bits = bits;
+        frame[0] = kSelectCommand[level];
+        frame[1] = sel_par(bytes, bits);
+        // The FIFO returns the PICC's answer with the bits we transmitted
+        // cleared, so keep our own copy of the split byte to OR back in.
+        const uint8_t sent_split = bits ? frame[bytes] : 0;
+
+        const AnticolReply reply = ops.anticollision(level, frame, bytes, bits);
+        if (bits) {
+            frame[bytes] = merge_split_byte(frame[bytes], sent_split, bits);
+        }
+
+        if (reply.outcome == AnticolOutcome::kCollision) {
+            const AnticollisionPrefix next = next_anticollision_prefix(reply.collision_status, frame);
+            if (!next.valid) {
+                break;
+            }
+            ++stats.collisions;
+            if (next.forced) {
+                // The 1 branch is the one we follow now; remember the 0 branch,
+                // with the frame truncated so nothing above the prefix leaks in.
+                if (pending_count < kMaxPendingBranches) {
+                    SearchBranch &branch = pending[pending_count];
+                    branch = SearchBranch{};
+                    branch.level = level;
+                    for (uint8_t i = 0; i + 1 < kCascadeLevels; ++i) {
+                        std::memcpy(branch.path[i], path[i], 4);
+                    }
+                    std::memcpy(branch.frame, frame, sizeof(branch.frame));
+                    branch.frame[next.forced_byte] =
+                        static_cast<uint8_t>(branch.frame[next.forced_byte] & ~(1u << next.forced_bit));
+                    for (uint8_t i = static_cast<uint8_t>(next.bits ? next.bytes + 1 : next.bytes);
+                         i < kAnticollisionFrameSize; ++i) {
+                        branch.frame[i] = 0;
+                    }
+                    branch.bytes = next.bytes;
+                    branch.bits = next.bits;
+                    ++pending_count;
+                    ++stats.branches_pushed;
+                } else {
+                    stats.hit_branch_cap = true;
+                }
+            }
+            bytes = next.bytes;
+            bits = next.bits;
+            continue;
+        }
+        if (reply.outcome != AnticolOutcome::kResolved || bytes + reply.rx_len != kAnticollisionFrameSize) {
+            break;
+        }
+        resolved = true;
+        break;
+    }
+    ops.end_anticollision(level);
+    return resolved && bcc(frame + 2, 4) == frame[6];
+}
+
+// Enumerate every PICC in the field. The caller has already polled, so the
+// first round runs on that poll and a field with a single PICC costs exactly
+// the frames it cost before: WUPA, anticollision, SELECT, and nothing else.
+// Returns the number of tags written to `tags`; the last one is left selected.
+template <typename Ops>
+uint8_t enumerate_tags(Ops &ops, EnumeratedTag *tags, uint8_t capacity, EnumerationStats &stats)
+{
+    SearchBranch pending[kMaxPendingBranches];
+    uint8_t pending_count = 0;
+    uint8_t count = 0;
+
+    SearchBranch branch;  // the root: cascade level 1, no prefix
+    bool need_poll = false;
+
+    while (count < capacity) {
+        if (stats.rounds >= kMaxEnumerationRounds) {
+            stats.hit_round_cap = true;
+            break;
+        }
+        ++stats.rounds;
+        if (need_poll && !ops.wupa()) {
+            break;
+        }
+        need_poll = true;
+
+        uint8_t parts[kCascadeLevels][4] = {};
+        bool ok = true;
+        // Walk back down to the branch's cascade level. Those levels are fully
+        // known, so they need a SELECT and no anticollision.
+        for (uint8_t level = 0; level < branch.level && ok; ++level) {
+            uint8_t frame[kAnticollisionFrameSize] = {};
+            frame[0] = kSelectCommand[level];
+            frame[1] = kNvbComplete;
+            std::memcpy(frame + 2, branch.path[level], 4);
+            frame[6] = bcc(branch.path[level], 4);
+            uint8_t sak = 0;
+            ok = ops.select(level, frame, sak) && (sak & kSakCascadeBit) != 0;
+            std::memcpy(parts[level], branch.path[level], 4);
+        }
+
+        uint8_t frame[kAnticollisionFrameSize] = {};
+        std::memcpy(frame, branch.frame, sizeof(frame));
+        uint8_t bytes = branch.bytes;
+        uint8_t bits = branch.bits;
+        uint8_t level = branch.level;
+        uint8_t sak = 0;
+        bool complete = false;
+
+        while (ok && level < kCascadeLevels) {
+            if (!resolve_anticollision_level(ops, level, frame, bytes, bits, parts, pending, pending_count, stats)) {
+                ok = false;
+                break;
+            }
+            frame[1] = kNvbComplete;
+            if (!ops.select(level, frame, sak)) {
+                ok = false;
+                break;
+            }
+            std::memcpy(parts[level], frame + 2, 4);
+            if ((sak & kSakCascadeBit) == 0) {
+                complete = true;
+                break;
+            }
+            ++level;
+            std::memset(frame, 0, sizeof(frame));
+            bytes = 2;
+            bits = 0;
+        }
+
+        if (complete) {
+            EnumeratedTag &tag = tags[count];
+            tag = EnumeratedTag{};
+            tag.uid_len = assemble_uid(parts, static_cast<uint8_t>(level + 1), tag.uid);
+            tag.sak = sak;
+            ++count;
+        }
+
+        if (pending_count == 0) {
+            break;
+        }
+        if (count >= capacity) {
+            stats.hit_tag_cap = true;
+            break;
+        }
+        // A PICC that has been selected sits in ACTIVE and ignores WUPA. HLTA
+        // parks it in HALT, where the next round's WUPA wakes it again; it then
+        // drops out on the first prefix byte that is not its own. HLTA to a
+        // PICC that is only part-way through its cascade is an error frame it
+        // answers by returning to IDLE, which WUPA also wakes, so this is safe
+        // whether or not the round got as far as a SELECT.
+        ops.halt();
+        branch = pending[--pending_count];
+    }
+    return count;
 }
 
 } // namespace st25r3916

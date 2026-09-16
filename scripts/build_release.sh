@@ -705,6 +705,15 @@ validate_st25r3916_spi_driver() {
     echo "error: st25r3916_spi ECP prefix is not the audited 6A 02 CB 02 06 20 42 20" >&2
     return 2
   fi
+  # Anticollision resolves every PICC in the field, not just the first branch.
+  for required_text in \
+      'uint8_t enumerate_tags(Ops &ops, EnumeratedTag *tags, uint8_t capacity, EnumerationStats &stats)' \
+      'bool resolve_anticollision_level('; do
+    if ! grep -Fq "$required_text" "$logic"; then
+      echo "error: st25r3916_spi frame logic is missing the multi-tag walk: $required_text" >&2
+      return 2
+    fi
+  done
   for required_text in \
       'constexpr uint32_t kEcpResponseTimeoutMs = 12;' \
       'constexpr uint32_t kEcpSettleTimeMs = 5;' \
@@ -716,6 +725,8 @@ validate_st25r3916_spi_driver() {
       'esphome::st25r::isodep_exchange_apdu(' \
       'return M5NFC_ACTIVATION_NON_ISO_DEP;' \
       'req.direct_cmd = kCmdTransmitWupa;' \
+      'enumerate_tags(ops, tags, kMaxTagsPerPoll, enumeration)' \
+      'NFC-A field holds %u tags%s: %s' \
       'NFC-A tag selected without ISO-DEP ATQA=%04x SAK=%02x UID=%s'; do
     if ! grep -Fq "$required_text" "$driver"; then
       echo "error: st25r3916_spi driver is missing: $required_text" >&2
