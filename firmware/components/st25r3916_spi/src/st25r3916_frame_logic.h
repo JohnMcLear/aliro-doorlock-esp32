@@ -193,4 +193,49 @@ inline uint8_t sel_par(uint8_t bytes, uint8_t bits)
     return static_cast<uint8_t>(((bytes << 4) & 0xF0) | (bits & 0x0F));
 }
 
+// The next anticollision prefix after a collision.
+//
+// COLLISION_STATUS (0x20) holds c_byte in bits 7:4 and c_bit in bits 3:1. The
+// position is absolute within the anticollision frame, which starts with SEL
+// and NVB, so c_byte 2..5 are the four UID bytes of this cascade level and
+// c_byte 6 is the BCC. Bits below the collision were received before it and
+// are valid; bits at and above it are not, so this clears them rather than
+// leaving whatever the previous round put in the buffer. The colliding bit is
+// then driven to 1, which is the branch rfalNfcaPollerSingleCollisionResolution
+// takes.
+//
+// A collision in the BCC means all four UID bytes are already known, so the
+// next round sends them whole and no bit is forced.
+struct AnticollisionPrefix {
+    bool valid = false;
+    uint8_t bytes = 0;  // whole bytes of the next frame, SEL and NVB included
+    uint8_t bits = 0;   // valid bits of the trailing partial byte, 0 for none
+};
+
+inline AnticollisionPrefix next_anticollision_prefix(uint8_t collision_status, uint8_t *frame)
+{
+    AnticollisionPrefix next;
+    const uint8_t c_byte = static_cast<uint8_t>((collision_status >> 4) & 0x0F);
+    const uint8_t c_bit = static_cast<uint8_t>((collision_status >> 1) & 0x07);
+    if (c_byte < 2 || c_byte > 6) {
+        return next;  // SEL/NVB is our own transmission; past the BCC is off-frame
+    }
+    next.valid = true;
+    if (c_byte == 6) {
+        next.bytes = 6;
+        next.bits = 0;
+        return next;
+    }
+    const uint8_t known = static_cast<uint8_t>((1u << c_bit) - 1u);
+    frame[c_byte] = static_cast<uint8_t>((frame[c_byte] & known) | (1u << c_bit));
+    if (c_bit == 7) {
+        next.bytes = static_cast<uint8_t>(c_byte + 1);
+        next.bits = 0;
+    } else {
+        next.bytes = c_byte;
+        next.bits = static_cast<uint8_t>(c_bit + 1);
+    }
+    return next;
+}
+
 } // namespace st25r3916

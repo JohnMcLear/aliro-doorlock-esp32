@@ -715,6 +715,7 @@ validate_st25r3916_spi_driver() {
       'command(kCmdResetRxGain)' \
       'esphome::st25r::isodep_exchange_apdu(' \
       'return M5NFC_ACTIVATION_NON_ISO_DEP;' \
+      'req.direct_cmd = kCmdTransmitWupa;' \
       'NFC-A tag selected without ISO-DEP ATQA=%04x SAK=%02x UID=%s'; do
     if ! grep -Fq "$required_text" "$driver"; then
       echo "error: st25r3916_spi driver is missing: $required_text" >&2
@@ -726,11 +727,17 @@ validate_st25r3916_spi_driver() {
     echo "error: st25r3916_spi must not write RX_CONF3=0xE2" >&2
     return 2
   fi
-  # The ECP frame goes out with CRC-A appended by the chip, before REQA.
+  # Polling is WUPA, not REQA: the poller halts every tag it reads, and a
+  # halted PICC answers WUPA only (ISO/IEC 14443-3 6.3).
+  if grep -Fq 'kCmdTransmitReqa' "$driver"; then
+    echo "error: st25r3916_spi must poll with WUPA, not REQA" >&2
+    return 2
+  fi
+  # The ECP frame goes out with CRC-A appended by the chip, before the poll.
   ecp_line="$(grep -n -F 'if (send_aliro_ecp())' "$driver" | cut -d: -f1)"
-  request_line="$(grep -n -F 'if (!request_a(atqa))' "$driver" | cut -d: -f1)"
+  request_line="$(grep -n -F 'if (!poll_a(atqa))' "$driver" | cut -d: -f1)"
   if [[ -z "$ecp_line" || -z "$request_line" || "$ecp_line" -ge "$request_line" ]]; then
-    echo "error: Aliro ECP must run before the NFC-A request" >&2
+    echo "error: Aliro ECP must run before the NFC-A poll" >&2
     return 2
   fi
   if ! sed -n '/^bool send_aliro_ecp()/,/^}/p' "$driver" | grep -Fq 'req.tx_crc = true;'; then

@@ -176,6 +176,55 @@ void test_anticollision_helpers()
     EXPECT_EQ(bcc(uid, 4), 0x82 ^ 0x81 ^ 0xA4 ^ 0x41);
 }
 
+void test_next_anticollision_prefix()
+{
+    // The case seen on the STEVAL bench with two NTAGs in the field:
+    // COLLISION_STATUS 0x40 is frame byte 4 (the second UID byte of CL1),
+    // bit 0. The next frame carries SEL, NVB and two whole UID bytes plus one
+    // bit, and that bit is driven to 1.
+    uint8_t frame[7] = {0x93, 0x20, 0x88, 0x04, 0x00, 0x00, 0x00};
+    AnticollisionPrefix next = next_anticollision_prefix(0x40, frame);
+    EXPECT_EQ(next.valid, 1);
+    EXPECT_EQ(next.bytes, 4);
+    EXPECT_EQ(next.bits, 1);
+    EXPECT_EQ(frame[4], 0x01);
+    EXPECT_EQ(sel_par(next.bytes, next.bits), 0x41);
+
+    // Bits at and above the collision are not valid data. Whatever the
+    // previous round left in the buffer must not survive into the prefix, or
+    // the reader transmits UID bits no PICC ever sent.
+    uint8_t stale[7] = {0x93, 0x20, 0x88, 0x04, 0xFF, 0xFF, 0xFF};
+    next = next_anticollision_prefix(0x44, stale);  // byte 4, bit 2
+    EXPECT_EQ(next.valid, 1);
+    EXPECT_EQ(next.bytes, 4);
+    EXPECT_EQ(next.bits, 3);
+    EXPECT_EQ(stale[4], 0x07);  // bits 0 and 1 kept, bit 2 forced to 1
+
+    // A collision in the top bit of a byte rolls the prefix on to whole bytes.
+    uint8_t top[7] = {0x93, 0x20, 0x11, 0x00, 0x00, 0x00, 0x00};
+    next = next_anticollision_prefix(0x2E, top);  // byte 2, bit 7
+    EXPECT_EQ(next.valid, 1);
+    EXPECT_EQ(next.bytes, 3);
+    EXPECT_EQ(next.bits, 0);
+    EXPECT_EQ(top[2], 0x91);
+    EXPECT_EQ(sel_par(next.bytes, next.bits), 0x30);
+
+    // A collision in the BCC means all four UID bytes are already known.
+    uint8_t in_bcc[7] = {0x93, 0x20, 0x88, 0x04, 0x1A, 0xA7, 0x00};
+    next = next_anticollision_prefix(0x60, in_bcc);
+    EXPECT_EQ(next.valid, 1);
+    EXPECT_EQ(next.bytes, 6);
+    EXPECT_EQ(next.bits, 0);
+    EXPECT_EQ(in_bcc[6], 0x00);  // the BCC byte is left alone
+    EXPECT_EQ(sel_par(next.bytes, next.bits), 0x60);
+
+    // SEL and NVB are our own transmission, and there is nothing past the BCC.
+    uint8_t any[7] = {0x93, 0x20, 0, 0, 0, 0, 0};
+    EXPECT_EQ(next_anticollision_prefix(0x10, any).valid, 0);
+    EXPECT_EQ(next_anticollision_prefix(0x70, any).valid, 0);
+    EXPECT_EQ(next_anticollision_prefix(0xF0, any).valid, 0);
+}
+
 } // namespace
 
 int main()
@@ -189,6 +238,7 @@ int main()
     test_nrt_range_switch();
     test_ecp_frame_bytes();
     test_anticollision_helpers();
+    test_next_anticollision_prefix();
     if (g_failures != 0) {
         std::printf("st25r3916 frame logic: %d failure(s)\n", g_failures);
         return EXIT_FAILURE;

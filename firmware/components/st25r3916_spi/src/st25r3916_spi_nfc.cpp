@@ -15,8 +15,9 @@
  *  - The m5nfc component at 0d00697 plus patch 0005 for the behaviour the door
  *    lock was verified against: FSDI 8, CID off, an FWT floor of
  *    CONFIG_ST25R3916_TRANSCEIVE_TIMEOUT_MS, a WTX ceiling of 5 s, three APDU
- *    attempts, REQA polling, DESELECT or HLTA on deactivate, and the Aliro ECP
- *    frame with its 12 ms response window and 5 ms settle before REQA.
+ *    attempts, DESELECT or HLTA on deactivate, and the Aliro ECP frame with
+ *    its 12 ms response window and 5 ms settle before the polling command.
+ *    Polling itself is WUPA, not m5nfc's REQA: see poll_a().
  */
 
 #include <m5nfc.h>
@@ -56,7 +57,7 @@ constexpr uint32_t kEcpSettleTimeMs = 5;
 
 // NFC-A timeouts. These are the chip's no-response timer, measured from the
 // end of our transmission, so a missing tag costs exactly this long.
-constexpr uint32_t kReqaTimeoutMs = 5;
+constexpr uint32_t kWupaTimeoutMs = 5;
 constexpr uint32_t kAnticollisionTimeoutMs = 8;
 constexpr uint32_t kSelectTimeoutMs = 8;
 constexpr uint32_t kRatsTimeoutMs = 10;
@@ -76,6 +77,7 @@ constexpr int64_t kHealthCheckIntervalUs = 5 * 1000 * 1000;
 constexpr int64_t kReinitBackoffUs = 5 * 1000 * 1000;
 constexpr int64_t kFirstStatusLogUs = 30 * 1000 * 1000;
 constexpr int64_t kStatusLogIntervalUs = 10 * 60 * 1000 * 1000LL;
+constexpr int64_t kCollisionLogIntervalUs = 5 * 1000 * 1000;
 
 constexpr uint32_t kIrqUsed =
     kIrqTxe | kIrqRxs | kIrqRxe | kIrqCol | kIrqNre | kIrqDct | kIrqErrors;
@@ -112,7 +114,7 @@ struct TxRxRequest {
     const uint8_t *tx = nullptr;   // nullptr with direct_cmd set: REQA/WUPA
     uint16_t tx_bytes = 0;         // whole bytes
     uint8_t tx_bits = 0;           // extra bits in a trailing partial byte
-    uint8_t direct_cmd = 0;        // kCmdTransmitReqa etc. when tx == nullptr
+    uint8_t direct_cmd = 0;        // kCmdTransmitWupa etc. when tx == nullptr
     bool tx_crc = true;
     bool rx_crc = true;            // chip checks CRC; driver strips it
     bool antcol = false;
@@ -143,7 +145,10 @@ struct Stats {
     uint32_t rx_errors = 0;
     uint32_t apdu_failures = 0;
     uint32_t reinits = 0;
+    uint32_t collisions = 0;
 } g_stats;
+
+int64_t g_next_collision_log_us = 0;
 
 // ECP state is written from the Matter task and read by the NFC task.
 std::array<uint8_t, kEcpFrameSize> g_aliro_ecp_frame = {
@@ -363,13 +368,22 @@ bool send_aliro_ecp()
     return true;
 }
 
-bool request_a(uint16_t &atqa)
+// Poll for a PICC with WUPA, not REQA.
+//
+// m5nfc_deactivate() ends every successful activation with HLTA (or DESELECT,
+// which also leaves the PICC halted). ISO/IEC 14443-3 6.3 says a PICC in the
+// HALT state answers WUPA only: REQA wakes IDLE PICCs and nothing else. With
+// REQA the reader therefore reads each credential exactly once and is then
+// deaf to it until it physically leaves the field and comes back, so a tap
+// that needs a second attempt can never get one. On the bench that showed up
+// as two reads in 302 polls; with WUPA the same card reads on every poll.
+bool poll_a(uint16_t &atqa)
 {
     TxRxRequest req;
-    req.direct_cmd = kCmdTransmitReqa;
+    req.direct_cmd = kCmdTransmitWupa;
     req.tx_crc = false;
     req.rx_crc = false;
-    req.timeout_ms = kReqaTimeoutMs;
+    req.timeout_ms = kWupaTimeoutMs;
     uint8_t rx[2] = {};
     size_t rx_len = 0;
     const RxStatus status = transceive(req, rx, sizeof(rx), rx_len, nullptr);
@@ -381,6 +395,24 @@ bool request_a(uint16_t &atqa)
     atqa = static_cast<uint16_t>((rx_len > 1 ? (rx[1] << 8) : 0) | rx[0]);
     return status == RxStatus::kOk || status == RxStatus::kCollision || status == RxStatus::kParity ||
         status == RxStatus::kFraming || status == RxStatus::kCrc;
+}
+
+// A collision means two or more PICCs answered the same anticollision frame,
+// so the UID this poll ends up reporting is one of several. Say so, throttled,
+// because silently picking a branch looks exactly like a corrupted UID from
+// outside the driver.
+void report_collision(uint8_t level, uint8_t collision_status)
+{
+    const int64_t now = esp_timer_get_time();
+    if (now < g_next_collision_log_us) {
+        return;
+    }
+    g_next_collision_log_us = now + kCollisionLogIntervalUs;
+    ESP_LOGI(kTag,
+             "NFC-A CL%u collision at frame byte %u bit %u (COLLISION_STATUS=0x%02x): more than one tag is in the "
+             "field. Taking the branch with a 1; the UID reported is one of them, not the only one.",
+             level + 1, static_cast<unsigned>((collision_status >> 4) & 0x0F),
+             static_cast<unsigned>((collision_status >> 1) & 0x07), collision_status);
 }
 
 // One cascade level of anticollision and SELECT, following
@@ -418,24 +450,15 @@ bool select_cascade_level(uint8_t level, uint8_t uid_part[4], uint8_t &sak)
             if (read_reg(kRegCollisionStatus, coll) != ESP_OK) {
                 break;
             }
-            bytes = static_cast<uint8_t>((coll >> 4) & 0x0F);
-            bits = static_cast<uint8_t>((coll >> 1) & 0x07);
-            if (bytes + (bits ? 1 : 0) > sizeof(frame) || bytes < 2) {
+            const AnticollisionPrefix next = next_anticollision_prefix(coll, frame);
+            if (!next.valid) {
                 ESP_LOGD(kTag, "anticollision: collision position out of range (0x%02x)", coll);
                 break;
             }
-            if (bytes + (bits ? 1 : 0) > 6) {
-                // A collision in the BCC byte: resolve on the UID part only.
-                bytes = 5;
-                bits = 7;
-            } else {
-                frame[bytes] = static_cast<uint8_t>(frame[bytes] | (1u << bits));
-            }
-            ++bits;
-            if (bits == 8) {
-                bits = 0;
-                ++bytes;
-            }
+            ++g_stats.collisions;
+            report_collision(level, coll);
+            bytes = next.bytes;
+            bits = next.bits;
             continue;
         }
         if (status != RxStatus::kOk || bytes + rx_len != sizeof(frame)) {
@@ -849,10 +872,10 @@ void log_status(const char *reason)
     measure_field(amplitude);
     ESP_LOGI(kTag,
              "NFC poller %s: polls=%" PRIu32 " tags=%" PRIu32 " iso_dep=%" PRIu32 " rx_errors=%" PRIu32
-             " apdu_failures=%" PRIu32 " reinits=%" PRIu32 " spi_errors=%" PRIu32 " irq_edges=%" PRIu32
-             " amplitude=%u",
-             reason, g_stats.polls, g_stats.tags, g_stats.iso_dep, g_stats.rx_errors, g_stats.apdu_failures,
-             g_stats.reinits, spi_error_count(), irq_edge_count(), amplitude);
+             " collisions=%" PRIu32 " apdu_failures=%" PRIu32 " reinits=%" PRIu32 " spi_errors=%" PRIu32
+             " irq_edges=%" PRIu32 " amplitude=%u",
+             reason, g_stats.polls, g_stats.tags, g_stats.iso_dep, g_stats.rx_errors, g_stats.collisions,
+             g_stats.apdu_failures, g_stats.reinits, spi_error_count(), irq_edge_count(), amplitude);
 }
 
 } // namespace
@@ -934,7 +957,7 @@ m5nfc_activation_result_t m5nfc_activate(void)
     }
 
     uint16_t atqa = 0;
-    if (!request_a(atqa)) {
+    if (!poll_a(atqa)) {
         return M5NFC_ACTIVATION_NONE;
     }
 
