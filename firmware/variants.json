@@ -203,7 +203,8 @@
         "firmware/patches/0006-add-aliro-settings.patch",
         "firmware/patches/0007-toggle-lock-on-aliro-tap.patch",
         "firmware/patches/0008-generalize-board-pins.patch",
-        "firmware/patches/0022-use-st25r3916-spi-reader.patch"
+        "firmware/patches/0022-use-st25r3916-spi-reader.patch",
+        "firmware/patches/0023-drive-a-lock-output-gpio.patch"
       ],
       "dependency_patches": [],
       "extra_component_dirs": [
@@ -231,7 +232,9 @@
       "improv_wait_time": 0,
       "matter_commissioning": "ble",
       "status": "bench",
-      "notes": "Source-only bench variant. Not part of the web installer release matrix, so it lives under bench_variants and scripts/assemble_release.py and the installer never see it. The ST25R3916B replaces the M5 Unit NFC; patch 0005 does not apply."
+      "notes": "Source-only bench variant. Not part of the web installer release matrix, so it lives under bench_variants and scripts/assemble_release.py and the installer never see it. The ST25R3916B replaces the M5 Unit NFC; patch 0005 does not apply.",
+      "lock_gpio": 2,
+      "lock_active_high": true
     }
   }
 }

@@ -36,3 +36,16 @@
 // BOOT button (shared with the ROM download strap on GPIO 9)
 #define ALIRO_BOARD_USER_BUTTON_GPIO 9
 #define ALIRO_BOARD_USER_BUTTON_ACTIVE_LOW 1
+
+// Lock actuator output, driven high while unlocked.
+//
+// GPIO 2 is the LED on John's ST25R prototyping board, which his ESPHome test
+// configs drive alongside GPIO 15 on every tag read. It is an indicator, not
+// the relay, but it proves the lock state reaches a pin.
+//
+// The relay looks like it is on GPIO 19, which on this board is the reader's
+// SPI clock. Nothing can drive it until the reader moves, so that is a wiring
+// decision rather than a firmware one. GPIO 15, 16 and 13 were tried and none
+// clicked the relay.
+#define ALIRO_BOARD_LOCK_GPIO 2
+#define ALIRO_BOARD_LOCK_ACTIVE_HIGH 1

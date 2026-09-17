@@ -1,0 +1,77 @@
+diff --git a/examples/door_lock/main/lock/door_lock_manager.cpp b/examples/door_lock/main/lock/door_lock_manager.cpp
+index 5d0f5a7..465dcb0 100644
+--- a/examples/door_lock/main/lock/door_lock_manager.cpp
++++ b/examples/door_lock/main/lock/door_lock_manager.cpp
+@@ -8,11 +8,58 @@
+ #include <platform/ESP32/ESP32Config.h>
+ #include <platform/CHIPDeviceError.h>
+ #include <app-common/zap-generated/attributes/Accessors.h>
++#include <driver/gpio.h>
++#include "aliro_board_config.h"
+ #include <cstring>
+ #include <esp_log.h>
+ 
+ static const char *TAG = "doorlock_manager";
+ 
++// Lock actuator output.
++//
++// The example is a virtual lock: it moves nothing, which is fine for proving a
++// credential but leaves no way to tell at the bench whether a command landed.
++// This drives one GPIO from the lock state, so a relay module clicks and
++// anything else can follow the line. The pin comes from the board header, so a
++// board without one does not compile this in.
++#ifdef ALIRO_BOARD_LOCK_GPIO
++namespace {
++
++constexpr gpio_num_t kLockGpio = static_cast<gpio_num_t>(ALIRO_BOARD_LOCK_GPIO);
++#if ALIRO_BOARD_LOCK_ACTIVE_HIGH
++constexpr uint32_t kUnlockedLevel = 1;
++#else
++constexpr uint32_t kUnlockedLevel = 0;
++#endif
++
++bool g_lock_gpio_ready = false;
++
++void ApplyLockGpio(bool unlocked)
++{
++    if (!g_lock_gpio_ready) {
++        gpio_config_t cfg = {};
++        cfg.pin_bit_mask = 1ULL << kLockGpio;
++        cfg.mode = GPIO_MODE_OUTPUT;
++        cfg.pull_up_en = GPIO_PULLUP_DISABLE;
++        cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
++        cfg.intr_type = GPIO_INTR_DISABLE;
++        if (gpio_config(&cfg) != ESP_OK) {
++            ESP_LOGE(TAG, "lock output: GPIO %d could not be configured", (int) kLockGpio);
++            return;
++        }
++        g_lock_gpio_ready = true;
++    }
++    const uint32_t level = unlocked ? kUnlockedLevel : (kUnlockedLevel ? 0u : 1u);
++    (void) gpio_set_level(kLockGpio, level);
++    ESP_LOGI(TAG, "lock output: GPIO %d -> %u (%s)", (int) kLockGpio, (unsigned) level,
++             unlocked ? "unlocked" : "locked");
++}
++
++} // namespace
++#else
++static void ApplyLockGpio(bool) {}
++#endif
++
+ BoltLockManager BoltLockManager::sLock;
+ 
+ using namespace chip;
+@@ -176,11 +223,13 @@ bool BoltLockManager::ReadConfigValues()
+ 
+ void BoltLockManager::Lock(EndpointId endpointId, OperationSourceEnum source)
+ {
++    ApplyLockGpio(false);
+     DoorLockServer::Instance().SetLockState(endpointId, DlLockState::kLocked, source);
+ }
+ 
+ void BoltLockManager::Unlock(EndpointId endpointId, OperationSourceEnum source)
+ {
++    ApplyLockGpio(true);
+     DoorLockServer::Instance().SetLockState(endpointId, DlLockState::kUnlocked, source);
+ }
+ 
