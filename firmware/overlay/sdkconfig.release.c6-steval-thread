@@ -33,3 +33,21 @@ CONFIG_ST25R3916_SPI_PIN_IRQ=7
 CONFIG_ST25R3916_SPI_FREQ_HZ=1000000
 CONFIG_ST25R3916_TRANSCEIVE_TIMEOUT_MS=100
 CONFIG_ST25R3916_SPI_ANTENNA_TUNING=y
+
+# --- Commissioning debug, 2026-09-21 --------------------------------------
+# Apple Home timed out twice adding this board, after accepting it as an
+# uncertified accessory, so the question is how far a commissioner gets. The
+# stock levels hide the answer: CHIP logs progress only, and OpenThread is
+# silent below warnings, so a Thread attach that never happens looks the same
+# as one that did. app_main pins the NFC tags back to INFO, because the poller
+# runs every 50 ms and would bury the rest.
+# Log level stays at INFO. Raising the maximum to DEBUG compiles debug log
+# lines inside connectedhomeip that do not build under this toolchain:
+# commodity-tariff-server.cpp prints uint32_t with %u and the build treats
+# format warnings as errors. Upstream's problem, in a cluster nothing here
+# uses, and INFO is enough: Matter progress logging, OpenThread at info, and
+# the commissioning lines added by patch 0024, which log at warning.
+CONFIG_CHIP_PROGRESS_LOGGING=y
+CONFIG_CHIP_ERROR_LOGGING=y
+CONFIG_OPENTHREAD_LOG_LEVEL_WARN=n
+CONFIG_OPENTHREAD_LOG_LEVEL_INFO=y

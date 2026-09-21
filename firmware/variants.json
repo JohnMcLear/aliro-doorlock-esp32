@@ -204,7 +204,8 @@
         "firmware/patches/0007-toggle-lock-on-aliro-tap.patch",
         "firmware/patches/0008-generalize-board-pins.patch",
         "firmware/patches/0022-use-st25r3916-spi-reader.patch",
-        "firmware/patches/0023-drive-a-lock-output-gpio.patch"
+        "firmware/patches/0023-drive-a-lock-output-gpio.patch",
+        "firmware/patches/0024-commissioning-debug.patch"
       ],
       "dependency_patches": [],
       "extra_component_dirs": [
