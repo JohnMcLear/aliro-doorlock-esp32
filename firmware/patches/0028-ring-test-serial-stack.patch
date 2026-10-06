@@ -1,0 +1,19 @@
+diff --git a/examples/door_lock/main/aliro_settings.cpp b/examples/door_lock/main/aliro_settings.cpp
+--- a/examples/door_lock/main/aliro_settings.cpp
++++ b/examples/door_lock/main/aliro_settings.cpp
+@@ -20,7 +20,14 @@
+ constexpr char kNvsKey[] = "config";
+ constexpr uint32_t kSettingsSchemaVersion = 1;
+ constexpr size_t kSerialLineSize = 256;
+-constexpr uint32_t kSerialTaskStackSize = 4096;
++// Ring applet test mode runs SetAliroReaderConfig (key derivation and NVS writes) on
++// this task; 4096 bytes overflowed on the first bench run (6 Oct 2026, stack
++// protection fault on "ring reader"). Release builds keep 4096.
++#if CONFIG_ALIRO_RING_TEST_MODE
++constexpr uint32_t kSerialTaskStackSize = 12288;
++#else
++constexpr uint32_t kSerialTaskStackSize = 4096;
++#endif
+ constexpr UBaseType_t kSerialTaskPriority = 2;
+ 
+ struct PersistedSettings {

@@ -727,7 +727,6 @@ esp_err_t chip_configure()
     delay_ms(10);
     ESP_RETURN_ON_ERROR(read_identity(identity), kTag, "chip lost after SET_DEFAULT");
     g_ic_identity = identity;
-    ESP_RETURN_ON_ERROR(spi_self_test(), kTag, "SPI register read-back failed at %d Hz", CONFIG_ST25R300_SPI_FREQ_HZ);
 
     // Oscillator on, confirmed by its interrupt and by STATUS1 osc_ok.
     ESP_RETURN_ON_ERROR(irq_set_enabled(kIrqUsed), kTag, "IRQ mask write failed");
@@ -749,6 +748,12 @@ esp_err_t chip_configure()
         ESP_LOGW(kTag, "oscillator stable but no edge on IRQ GPIO %d; falling back to per-tick polling",
                  CONFIG_ST25R300_SPI_PIN_IRQ);
     }
+
+    // Register read-back only once the oscillator runs: in power-down the chip answers
+    // reads (IC_IDENTITY works) but register writes do not stick, which made this test
+    // fail on the first bench run (6 Oct: wrote a5/5a, read 00/00). The ESPHome driver
+    // never tests before enabling the oscillator.
+    ESP_RETURN_ON_ERROR(spi_self_test(), kTag, "SPI register read-back failed at %d Hz", CONFIG_ST25R300_SPI_FREQ_HZ);
 
     // VDDDR regulator, then tx/rx on, then regulator adjustment.
     ESP_RETURN_ON_ERROR(write_reg(kRegOperation, kOpEn | kOpVdddrEn), kTag, "OPERATION write failed");
