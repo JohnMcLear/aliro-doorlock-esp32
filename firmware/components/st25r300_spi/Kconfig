@@ -1,0 +1,108 @@
+menu "ST25R300 SPI NFC reader"
+
+    config ST25R300_SPI_HOST
+        int "SPI host (1 = SPI2_HOST)"
+        default 1
+        help
+            ESP-IDF spi_host_device_t value. SPI2_HOST is the general purpose
+            SPI controller on ESP32-C6.
+
+    config ST25R300_SPI_PIN_SCLK
+        int "SCLK GPIO"
+        default 19
+
+    config ST25R300_SPI_PIN_MISO
+        int "MISO GPIO"
+        default 20
+
+    config ST25R300_SPI_PIN_MOSI
+        int "MOSI GPIO"
+        default 21
+
+    config ST25R300_SPI_PIN_CS
+        int "CS GPIO"
+        default 22
+
+    config ST25R300_SPI_PIN_IRQ
+        int "IRQ GPIO (-1 to poll)"
+        default 23
+        help
+            ST25R300 interrupt output, active high. With -1 the driver polls
+            the IRQ status registers once per FreeRTOS tick, which is how the
+            ESPHome driver runs; it works but adds latency to every frame.
+
+    config ST25R300_SPI_PIN_RST
+        int "RESET GPIO (-1 if not wired)"
+        default 18
+        help
+            ST25R300 RESET input, active high: high holds the chip in reset,
+            low lets it run. Pulsed at start-up and before every re-init.
+
+    config ST25R300_SPI_FREQ_HZ
+        int "SPI clock (Hz)"
+        default 1000000
+        range 100000 10000000
+        help
+            The chip accepts up to 10 MHz. The ESPHome driver runs at 200 kHz.
+            The boot self-test reads registers back and refuses to run if the
+            link is not clean; drop to 200000 if it fails on long leads.
+
+    config ST25R300_RF_POWER
+        int "RF power (0 lowest, 15 highest)"
+        default 15
+        range 0 15
+        help
+            Written to TX_DRIVER as d_res = 15 - power, as the ESPHome driver
+            does. 15 is the lowest driver resistance.
+
+    config ST25R300_ISODEP_FSDI
+        int "ISO-DEP FSDI sent in RATS"
+        default 8
+        range 2 8
+        help
+            8 means FSD 256, the largest frame the 256-byte FIFO holds. Lower
+            values make the card send smaller frames and chain more.
+
+    config ST25R300_FWT_FLOOR_MS
+        int "Minimum ISO-DEP frame waiting time (ms)"
+        default 100
+        range 1 19800
+        help
+            Floor for the FWT taken from the card's ATS. Raise it for a card
+            that computes for a long time without sending S(WTX). Can also be
+            changed at run time through st25r300_nfc.h.
+
+    config ST25R300_WTX_CEILING_MS
+        int "Longest single wait after granting S(WTX) (ms)"
+        default 5000
+        range 100 19800
+        help
+            Each S(WTX) grant waits FWT x WTXM, capped here. ISO/IEC 14443-4
+            caps FWT at about 4949 ms.
+
+    config ST25R300_APDU_BUDGET_MS
+        int "Wall-clock budget for one APDU, WTX waits included (ms)"
+        default 30000
+        range 100 120000
+        help
+            A slow card may request S(WTX) hundreds of times during one APDU.
+            The driver keeps granting until this budget runs out, instead of
+            stopping after a fixed count. Phones finish in well under a second.
+
+    config ST25R300_MAX_WTX
+        int "Backstop on S(WTX) grants per APDU"
+        default 5000
+        range 8 100000
+        help
+            Only matters for a card that keeps asking for time with a tiny
+            FWT; the wall-clock budget normally ends things first.
+
+    config ST25R300_APDU_ATTEMPTS
+        int "Attempts per APDU"
+        default 3
+        range 1 5
+        help
+            Same as the ST25R3916 driver. Retrying an APDU that a slow card is
+            still working on rarely helps; the ring test mode sets 1.
+
+endmenu

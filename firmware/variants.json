@@ -296,6 +296,66 @@
       "notes": "Created 2026-09-24 to bypass the Apple TV Thread border router fault proved that evening: the board pings 0% loss through a Home Assistant border router and 100% loss through the Apple TV, same firmware. A Matter-over-Wi-Fi device has no border router in its path. Identical to c6-steval-thread apart from CONFIG_ENABLE_WIFI_STATION=y and CONFIG_OPENTHREAD_ENABLED=n, so any behaviour difference is transport. UNVERIFIED: no hardware run yet. Patch 0025-thread-reachability-diagnostics is EXCLUDED from this variant: it calls otIp6AddressToString, otThreadGetChildTimeout and esp_openthread_lock_release, which do not exist when CONFIG_OPENTHREAD_ENABLED=n. A Thread diagnostics patch cannot compile in a Wi-Fi build. Nothing is lost, it would have been inert anyway.",
       "lock_gpio": 2,
       "lock_active_high": true
+    },
+    "c6-st25r300-wifi-ringtest": {
+      "id": "c6-st25r300-wifi-ringtest",
+      "project_name": "aliro-c6-st25r300-ringtest",
+      "product_label": "Aliro ring applet test reader: ESP32-C6 devkit + ST25R300 (Matter over Wi-Fi)",
+      "board_id": "c6-st25r300",
+      "board_label": "ESP32-C6 devkit + ST25R300 reader board (SPI)",
+      "chip": "esp32c6",
+      "chip_family": "ESP32-C6",
+      "flash_size": "4MB",
+      "transport": "wifi",
+      "transport_label": "Matter over Wi-Fi",
+      "transport_requirements": "None for the ring test mode: reader keys and test credentials are loaded over USB serial. Matter over Wi-Fi still runs and can be ignored.",
+      "base_sdkconfig": "sdkconfig.esp32c6.aliro",
+      "base_sdkconfig_source": "upstream",
+      "release_overlay": "firmware/overlay/sdkconfig.release.c6-st25r300-wifi-ringtest",
+      "source_patches": [
+        "firmware/patches/0001-print-onboarding-codes.patch",
+        "firmware/patches/0002-advertise-aliro-credentials-only.patch",
+        "firmware/patches/0003-add-nanoc6-rgb-feedback.patch",
+        "firmware/patches/0004-wire-aliro-ecp-and-generic-tags.patch",
+        "firmware/patches/0006-add-aliro-settings.patch",
+        "firmware/patches/0007-toggle-lock-on-aliro-tap.patch",
+        "firmware/patches/0008-generalize-board-pins.patch",
+        "firmware/patches/0022-use-st25r3916-spi-reader.patch",
+        "firmware/patches/0023-drive-a-lock-output-gpio.patch",
+        "firmware/patches/0024-commissioning-debug.patch",
+        "firmware/patches/0026-one-tap-one-lock-action.patch",
+        "firmware/patches/0027-ring-applet-test-mode.patch"
+      ],
+      "dependency_patches": [],
+      "extra_component_dirs": [
+        "firmware/components/st25r300_spi"
+      ],
+      "board_config_header": "firmware/board_config/c6_st25r300.h",
+      "nfc_driver": "st25r300-spi",
+      "nfc_spi_sclk_gpio": 19,
+      "nfc_spi_miso_gpio": 20,
+      "nfc_spi_mosi_gpio": 21,
+      "nfc_spi_cs_gpio": 22,
+      "nfc_irq_gpio": 23,
+      "nfc_rst_gpio": 18,
+      "rgb_data_gpio": 8,
+      "rgb_power_gpio": null,
+      "has_rgb_power_pin": false,
+      "user_button_gpio": 9,
+      "user_button_active_low": true,
+      "partition_layout_id": "esp32c6-door-lock-4mb-v1",
+      "partition_table_sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
+      "ota_slot_size_hex": "0x1E0000",
+      "ota_offsets_hex": [
+        "0x20000",
+        "0x200000"
+      ],
+      "improv_wait_time": 0,
+      "matter_commissioning": "ble",
+      "status": "bench",
+      "notes": "Created 2026-10-06 for VivoKey's Aliro ring applet work. Same source patches as c6-steval-wifi plus 0027 (ring applet test mode), on the ST25R300 driver (firmware/components/st25r300_spi) instead of the ST25R3916B one. RST and IRQ pins (18, 23) are a new choice; the SPI pins are the exterior ESPHome prototype's. UNVERIFIED: compiles, never run on hardware.",
+      "lock_gpio": 2,
+      "lock_active_high": true
     }
   }
 }

@@ -1,0 +1,1149 @@
+diff --git a/examples/door_lock/main/Kconfig.projbuild b/examples/door_lock/main/Kconfig.projbuild
+index 0877e87..a3db93b 100644
+--- a/examples/door_lock/main/Kconfig.projbuild
++++ b/examples/door_lock/main/Kconfig.projbuild
+@@ -6,4 +6,15 @@ menu "Example Configuration"
+         help
+             Enable this option to enable Aliro-over-NFC feature for DoorLock cluster.
+ 
++    config ALIRO_RING_TEST_MODE
++        bool "Ring applet test mode (TEST KEYS ONLY)"
++        depends on ENABLE_ALIRO_OVER_NFC
++        default n
++        help
++            For credential applet developers. Adds "ring" commands to the USB
++            serial console that load reader keys and trusted credential endpoint
++            public keys without Matter, time every APDU of a transaction, and
++            trace APDUs in hex. Never enable this on a reader that guards a
++            real door: anyone with the console can load keys.
++
+ endmenu
+diff --git a/examples/door_lock/main/aliro_ring_test.cpp b/examples/door_lock/main/aliro_ring_test.cpp
+new file mode 100644
+index 0000000..b469490
+--- /dev/null
++++ b/examples/door_lock/main/aliro_ring_test.cpp
+@@ -0,0 +1,948 @@
++// Ring applet test mode (patch 0027). See aliro_ring_test.h and
++// docs/ring-applet-test-mode.md in the aliro-doorlock-esp32 repository.
++//
++// Everything printed here starts with "RING" so it can be grepped out of a
++// log that also carries Matter and driver output.
++
++#include "aliro_ring_test.h"
++
++#if CONFIG_ALIRO_RING_TEST_MODE
++
++#include <esp_aliro_utils.h>
++#include <esp_log.h>
++#include <esp_random.h>
++#include <esp_timer.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/semphr.h>
++#include <mbedtls/ecp.h>
++#include <nvs.h>
++
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#if __has_include(<st25r300_nfc.h>)
++#include <st25r300_nfc.h>
++#define RING_HAVE_ST25R300 1
++#else
++#define RING_HAVE_ST25R300 0
++#endif
++
++#include "aliro_door_lock_delegate.h"
++
++namespace {
++
++constexpr char kTag[] = "ring_test";
++
++// NVS names are capped at 15 characters; a longer namespace silently reads as
++// "never stored" (UltraWideLock lesson 2.4).
++constexpr char kNvsNamespace[] = "aliro_ring";
++constexpr char kKeyPriv[] = "priv";
++constexpr char kKeyGroup[] = "group";
++constexpr char kKeyEndpoints[] = "endpoints";
++constexpr char kKeyTrust[] = "trust";
++constexpr char kKeyBudget[] = "budget";
++constexpr char kKeyFwt[] = "fwt";
++constexpr char kKeyWtxCap[] = "wtxcap";
++constexpr char kKeyAttempts[] = "attempts";
++constexpr char kKeyApduTrace[] = "apdutrace";
++constexpr char kKeyFrameTrace[] = "frametrace";
++static_assert(sizeof(kNvsNamespace) - 1 <= 15, "NVS namespace too long");
++static_assert(sizeof(kKeyFrameTrace) - 1 <= 15, "NVS key too long");
++
++constexpr size_t kPrivLen = 32;
++constexpr size_t kPubLen = 65;
++constexpr size_t kGroupLen = 16;
++constexpr size_t kMaxEndpoints = 8;
++constexpr size_t kKeySlotMax = 16;
++constexpr size_t kPemMax = 256;
++constexpr size_t kMaxSteps = 24;
++
++struct Endpoint {
++    uint8_t pub[kPubLen];
++    uint8_t slot[kKeySlotMax];
++    size_t slot_len;
++};
++
++struct StoredEndpoints {
++    uint32_t count;
++    uint8_t pub[kMaxEndpoints][kPubLen];
++};
++
++enum class Trust : uint8_t {
++    kList = 0,  // only endpoint keys loaded here are accepted (key-slot lookup)
++    kAny = 1,   // no lookup registered; esp-aliro is left to its own devices
++};
++
++struct Step {
++    char name[16];
++    uint8_t cla;
++    uint8_t ins;
++    uint32_t ms;
++    size_t command_len;
++    size_t response_len;
++    uint16_t sw;
++    esp_err_t err;
++    uint32_t wtx;
++    bool budget_exceeded;
++    bool wtx_limit;
++    const char *last_frame;
++};
++
++SemaphoreHandle_t g_mutex = nullptr;  // guards g_endpoints and g_trust
++Endpoint g_endpoints[kMaxEndpoints];
++size_t g_endpoint_count = 0;
++Trust g_trust = Trust::kList;
++bool g_apdu_trace = false;
++
++// Session state, owned by the NFC task.
++int64_t g_session_start_us = 0;
++Step g_steps[kMaxSteps];
++size_t g_step_count = 0;
++size_t g_steps_dropped = 0;
++const char *g_transaction_type = "unknown";
++
++class Lock {
++public:
++    Lock() { xSemaphoreTake(g_mutex, portMAX_DELAY); }
++    ~Lock() { xSemaphoreGive(g_mutex); }
++};
++
++// ---------------------------------------------------------------------------
++// Small helpers
++
++void PrintHexLine(const char *prefix, const uint8_t *data, size_t len)
++{
++    printf("%s", prefix);
++    for (size_t i = 0; i < len; ++i) {
++        printf("%02X", data[i]);
++    }
++    printf("\n");
++}
++
++void PrintHexDump(const char *prefix, const uint8_t *data, size_t len)
++{
++    for (size_t offset = 0; offset < len; offset += 32) {
++        const size_t chunk = len - offset < 32 ? len - offset : 32;
++        printf("%s%s", prefix, offset ? "+ " : "");
++        for (size_t i = 0; i < chunk; ++i) {
++            printf("%02X ", data[offset + i]);
++        }
++        printf("\n");
++    }
++    fflush(stdout);
++}
++
++bool ParseHex(const char *text, uint8_t *out, size_t out_len)
++{
++    if (!text || strlen(text) != out_len * 2) {
++        return false;
++    }
++    for (size_t i = 0; i < out_len; ++i) {
++        unsigned value = 0;
++        for (int nibble = 0; nibble < 2; ++nibble) {
++            const char c = text[i * 2 + nibble];
++            unsigned v;
++            if (c >= '0' && c <= '9') {
++                v = static_cast<unsigned>(c - '0');
++            } else if (c >= 'a' && c <= 'f') {
++                v = static_cast<unsigned>(c - 'a' + 10);
++            } else if (c >= 'A' && c <= 'F') {
++                v = static_cast<unsigned>(c - 'A' + 10);
++            } else {
++                return false;
++            }
++            value = (value << 4) | v;
++        }
++        out[i] = static_cast<uint8_t>(value);
++    }
++    return true;
++}
++
++bool ParseU32(const char *text, uint32_t min, uint32_t max, uint32_t &out)
++{
++    if (!text || !*text) {
++        return false;
++    }
++    char *end = nullptr;
++    const unsigned long value = strtoul(text, &end, 10);
++    if (*end != '\0' || value < min || value > max) {
++        return false;
++    }
++    out = static_cast<uint32_t>(value);
++    return true;
++}
++
++int RingRng(void *, unsigned char *buf, size_t len)
++{
++    esp_fill_random(buf, len);
++    return 0;
++}
++
++// Reader public key from its private key, P-256, uncompressed (04 || X || Y).
++bool DerivePublicKey(const uint8_t priv[kPrivLen], uint8_t pub[kPubLen])
++{
++    mbedtls_ecp_group grp;
++    mbedtls_ecp_point q;
++    mbedtls_mpi d;
++    mbedtls_ecp_group_init(&grp);
++    mbedtls_ecp_point_init(&q);
++    mbedtls_mpi_init(&d);
++    size_t olen = 0;
++    const bool ok = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
++        mbedtls_mpi_read_binary(&d, priv, kPrivLen) == 0 && mbedtls_ecp_check_privkey(&grp, &d) == 0 &&
++        mbedtls_ecp_mul(&grp, &q, &d, &grp.G, RingRng, nullptr) == 0 &&
++        mbedtls_ecp_point_write_binary(&grp, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pub, kPubLen) == 0 &&
++        olen == kPubLen;
++    mbedtls_mpi_free(&d);
++    mbedtls_ecp_point_free(&q);
++    mbedtls_ecp_group_free(&grp);
++    return ok;
++}
++
++bool IsValidPublicKey(const uint8_t pub[kPubLen])
++{
++    mbedtls_ecp_group grp;
++    mbedtls_ecp_point q;
++    mbedtls_ecp_group_init(&grp);
++    mbedtls_ecp_point_init(&q);
++    const bool ok = pub[0] == 0x04 && mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
++        mbedtls_ecp_point_read_binary(&grp, &q, pub, kPubLen) == 0 && mbedtls_ecp_check_pubkey(&grp, &q) == 0;
++    mbedtls_ecp_point_free(&q);
++    mbedtls_ecp_group_free(&grp);
++    return ok;
++}
++
++// esp-aliro's PEM for a raw public key, NUL terminated. Returns the length the
++// library reported, which is what its own parser expects back.
++bool PemFromRaw(const uint8_t pub[kPubLen], char *pem, size_t pem_capacity, size_t &pem_len)
++{
++    pem_len = pem_capacity - 1;
++    if (esp_aliro_get_pubkey_pem_from_raw_data(pub, kPubLen, pem, &pem_len) != ESP_OK || pem_len >= pem_capacity) {
++        return false;
++    }
++    pem[pem_len] = '\0';
++    return true;
++}
++
++// The Aliro key slot esp-aliro derives for a credential public key. Tried with
++// and without the terminating NUL, because mbedTLS wants the NUL counted for
++// PEM input and the library's documentation does not say which it passes on.
++bool KeySlotFor(const uint8_t pub[kPubLen], uint8_t *slot, size_t &slot_len)
++{
++    char pem[kPemMax];
++    size_t pem_len = 0;
++    if (!PemFromRaw(pub, pem, sizeof(pem), pem_len)) {
++        return false;
++    }
++    const size_t text_len = strlen(pem);
++    const size_t candidates[2] = {text_len + 1, text_len};
++    for (size_t candidate : candidates) {
++        slot_len = kKeySlotMax;
++        if (esp_aliro_get_key_slot_from_cred_pubkey(pem, candidate, slot, &slot_len) == ESP_OK) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// ---------------------------------------------------------------------------
++// NVS
++
++esp_err_t NvsSetBlob(const char *key, const void *data, size_t len)
++{
++    nvs_handle_t handle;
++    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
++    if (err != ESP_OK) {
++        return err;
++    }
++    err = nvs_set_blob(handle, key, data, len);
++    if (err == ESP_OK) {
++        err = nvs_commit(handle);
++    }
++    nvs_close(handle);
++    return err;
++}
++
++esp_err_t NvsGetBlob(const char *key, void *data, size_t len)
++{
++    nvs_handle_t handle;
++    esp_err_t err = nvs_open(kNvsNamespace, NVS_READONLY, &handle);
++    if (err != ESP_OK) {
++        return err;
++    }
++    size_t size = len;
++    err = nvs_get_blob(handle, key, data, &size);
++    nvs_close(handle);
++    if (err == ESP_OK && size != len) {
++        return ESP_ERR_INVALID_SIZE;
++    }
++    return err;
++}
++
++esp_err_t NvsSetU32(const char *key, uint32_t value)
++{
++    nvs_handle_t handle;
++    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
++    if (err != ESP_OK) {
++        return err;
++    }
++    err = nvs_set_u32(handle, key, value);
++    if (err == ESP_OK) {
++        err = nvs_commit(handle);
++    }
++    nvs_close(handle);
++    return err;
++}
++
++bool NvsGetU32(const char *key, uint32_t &value)
++{
++    nvs_handle_t handle;
++    if (nvs_open(kNvsNamespace, NVS_READONLY, &handle) != ESP_OK) {
++        return false;
++    }
++    const bool ok = nvs_get_u32(handle, key, &value) == ESP_OK;
++    nvs_close(handle);
++    return ok;
++}
++
++esp_err_t NvsErase(const char *key)
++{
++    nvs_handle_t handle;
++    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
++    if (err != ESP_OK) {
++        return err;
++    }
++    err = nvs_erase_key(handle, key);
++    if (err == ESP_ERR_NVS_NOT_FOUND) {
++        err = ESP_OK;
++    }
++    if (err == ESP_OK) {
++        err = nvs_commit(handle);
++    }
++    nvs_close(handle);
++    return err;
++}
++
++esp_err_t StoreEndpoints()
++{
++    StoredEndpoints stored = {};
++    {
++        Lock lock;
++        stored.count = static_cast<uint32_t>(g_endpoint_count);
++        for (size_t i = 0; i < g_endpoint_count; ++i) {
++            memcpy(stored.pub[i], g_endpoints[i].pub, kPubLen);
++        }
++    }
++    return NvsSetBlob(kKeyEndpoints, &stored, sizeof(stored));
++}
++
++void LoadEndpoints()
++{
++    StoredEndpoints stored = {};
++    if (NvsGetBlob(kKeyEndpoints, &stored, sizeof(stored)) != ESP_OK || stored.count > kMaxEndpoints) {
++        return;
++    }
++    Lock lock;
++    g_endpoint_count = 0;
++    for (size_t i = 0; i < stored.count; ++i) {
++        Endpoint &ep = g_endpoints[g_endpoint_count];
++        memcpy(ep.pub, stored.pub[i], kPubLen);
++        if (!KeySlotFor(ep.pub, ep.slot, ep.slot_len)) {
++            ESP_LOGW(kTag, "stored endpoint key %u has no key slot; skipped", static_cast<unsigned>(i));
++            continue;
++        }
++        ++g_endpoint_count;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Reader
++
++esp_err_t LookupCredentialPubkey(const uint8_t *key_slot, size_t key_slot_len, char *out_pubkey,
++                                 size_t *out_pubkey_len)
++{
++    PrintHexLine("RING key slot lookup: ", key_slot, key_slot_len);
++    uint8_t pub[kPubLen];
++    int found = -1;
++    {
++        Lock lock;
++        for (size_t i = 0; i < g_endpoint_count; ++i) {
++            if (g_endpoints[i].slot_len == key_slot_len && memcmp(g_endpoints[i].slot, key_slot, key_slot_len) == 0) {
++                memcpy(pub, g_endpoints[i].pub, kPubLen);
++                found = static_cast<int>(i);
++                break;
++            }
++        }
++    }
++    if (found < 0) {
++        printf("RING key slot lookup: NO MATCH among %u loaded endpoint key(s); credential rejected\n",
++               static_cast<unsigned>(g_endpoint_count));
++        fflush(stdout);
++        return ESP_ERR_NOT_FOUND;
++    }
++    char pem[kPemMax];
++    size_t pem_len = 0;
++    if (!out_pubkey || !out_pubkey_len || !PemFromRaw(pub, pem, sizeof(pem), pem_len) || pem_len >= *out_pubkey_len) {
++        printf("RING key slot lookup: matched endpoint %d but its PEM does not fit the library buffer\n", found);
++        return ESP_ERR_INVALID_SIZE;
++    }
++    memcpy(out_pubkey, pem, pem_len + 1);
++    *out_pubkey_len = pem_len;
++    printf("RING key slot lookup: matched endpoint %d\n", found);
++    fflush(stdout);
++    return ESP_OK;
++}
++
++// Apply a reader configuration the way a Matter administrator would, through
++// the delegate's own SetAliroReaderConfig, so the path under test is the one
++// a phone-provisioned reader uses. Clear first: Set refuses a configured reader.
++bool ApplyReader(const uint8_t priv[kPrivLen], const uint8_t group[kGroupLen])
++{
++    uint8_t pub[kPubLen];
++    if (!DerivePublicKey(priv, pub)) {
++        printf("RING ERROR reader private key is not a valid P-256 scalar\n");
++        return false;
++    }
++    AliroDoorLockDelegate &delegate = AliroDoorLockDelegate::Instance();
++    CHIP_ERROR err = delegate.ClearAliroReaderConfig();
++    if (err != CHIP_NO_ERROR) {
++        printf("RING ERROR could not clear the previous reader config: %" CHIP_ERROR_FORMAT "\n", err.Format());
++        return false;
++    }
++    err = delegate.SetAliroReaderConfig(ByteSpan(priv, kPrivLen), ByteSpan(pub, kPubLen), ByteSpan(group, kGroupLen),
++                                        chip::NullOptional);
++    if (err != CHIP_NO_ERROR) {
++        printf("RING ERROR SetAliroReaderConfig failed: %" CHIP_ERROR_FORMAT "\n", err.Format());
++        return false;
++    }
++    return true;
++}
++
++bool ReloadReader()
++{
++    uint8_t priv[kPrivLen];
++    uint8_t group[kGroupLen];
++    if (NvsGetBlob(kKeyPriv, priv, sizeof(priv)) != ESP_OK || NvsGetBlob(kKeyGroup, group, sizeof(group)) != ESP_OK) {
++        printf("RING no reader loaded with \"ring reader\"; endpoint and trust changes apply at the next boot\n");
++        return false;
++    }
++    const bool ok = ApplyReader(priv, group);
++    memset(priv, 0, sizeof(priv));
++    if (ok) {
++        printf("RING reader reloaded\n");
++    }
++    return ok;
++}
++
++void ShowReader()
++{
++    AliroDoorLockDelegate &delegate = AliroDoorLockDelegate::Instance();
++    uint8_t buf[kPubLen];
++    MutableByteSpan pub(buf);
++    if (delegate.GetAliroReaderVerificationKey(pub) != CHIP_NO_ERROR || pub.size() == 0) {
++        printf("RING reader: NOT CONFIGURED (use: ring reader <private key hex> <group id hex>)\n");
++        return;
++    }
++    PrintHexLine("RING reader public key      : ", pub.data(), pub.size());
++    uint8_t gbuf[16];
++    MutableByteSpan group(gbuf);
++    if (delegate.GetAliroReaderGroupIdentifier(group) == CHIP_NO_ERROR) {
++        PrintHexLine("RING reader group id        : ", group.data(), group.size());
++    }
++    uint8_t sbuf[16];
++    MutableByteSpan sub(sbuf);
++    if (delegate.GetAliroReaderGroupSubIdentifier(sub) == CHIP_NO_ERROR) {
++        PrintHexLine("RING reader group sub-id    : ", sub.data(), sub.size());
++    }
++    uint8_t priv[kPrivLen];
++    const bool via_ring = NvsGetBlob(kKeyPriv, priv, sizeof(priv)) == ESP_OK;
++    memset(priv, 0, sizeof(priv));
++    printf("RING reader keys loaded via : %s\n", via_ring ? "ring reader" : "Matter (or an earlier build)");
++}
++
++void ShowSettings()
++{
++    printf("RING ===== ring applet test mode: TEST KEYS ONLY, NOT FOR A REAL DOOR =====\n");
++    ShowReader();
++    {
++        Lock lock;
++        printf("RING trust mode             : %s\n",
++               g_trust == Trust::kList ? "list (only the endpoint keys below are accepted)"
++                                       : "any (no key-slot lookup registered)");
++        printf("RING endpoint keys          : %u of %u\n", static_cast<unsigned>(g_endpoint_count),
++               static_cast<unsigned>(kMaxEndpoints));
++        for (size_t i = 0; i < g_endpoint_count; ++i) {
++            printf("RING   [%u] key slot ", static_cast<unsigned>(i));
++            for (size_t j = 0; j < g_endpoints[i].slot_len; ++j) {
++                printf("%02X", g_endpoints[i].slot[j]);
++            }
++            printf(" public key ");
++            for (size_t j = 0; j < kPubLen; ++j) {
++                printf("%02X", g_endpoints[i].pub[j]);
++            }
++            printf("\n");
++        }
++    }
++#if RING_HAVE_ST25R300
++    printf("RING APDU budget            : %" PRIu32 " ms (ring budget <ms>)\n", st25r300_get_apdu_budget_ms());
++    printf("RING FWT floor              : %" PRIu32 " ms (ring fwt <ms>)\n", st25r300_get_fwt_floor_ms());
++    printf("RING WTX ceiling            : %" PRIu32 " ms (ring wtxcap <ms>)\n", st25r300_get_wtx_ceiling_ms());
++    printf("RING attempts per APDU      : %u (ring attempts <n>)\n", st25r300_get_apdu_attempts());
++    printf("RING frame trace            : %s\n", st25r300_get_frame_trace() ? "on" : "off");
++#endif
++    printf("RING APDU trace             : %s\n", g_apdu_trace ? "on" : "off");
++    fflush(stdout);
++}
++
++void ShowHelp()
++{
++    printf("RING commands (one per line, on the USB serial console):\n"
++           "RING   ring help\n"
++           "RING   ring show\n"
++           "RING   ring reader <private key, 64 hex> <group id, 32 hex>   load TEST reader keys\n"
++           "RING   ring reader clear\n"
++           "RING   ring endpoint add <public key, 130 hex, 04...>          trust a TEST credential\n"
++           "RING   ring endpoint del <index>\n"
++           "RING   ring endpoint clear\n"
++           "RING   ring trust list|any\n"
++           "RING   ring budget <ms>      wall clock per APDU, WTX included (100..120000)\n"
++           "RING   ring fwt <ms>         minimum frame waiting time (1..19800)\n"
++           "RING   ring wtxcap <ms>      longest single wait after a WTX grant (100..19800)\n"
++           "RING   ring attempts <n>     attempts per APDU (1..5)\n"
++           "RING   ring trace apdu on|off\n"
++           "RING   ring trace frames on|off\n"
++           "RING   ring reload           re-create the reader so endpoint/trust changes apply\n"
++           "RING   ring fastclear        forget fast-transaction keys, so the next tap is a standard one\n");
++    fflush(stdout);
++}
++
++void PersistDriverKnobs()
++{
++#if RING_HAVE_ST25R300
++    (void)NvsSetU32(kKeyBudget, st25r300_get_apdu_budget_ms());
++    (void)NvsSetU32(kKeyFwt, st25r300_get_fwt_floor_ms());
++    (void)NvsSetU32(kKeyWtxCap, st25r300_get_wtx_ceiling_ms());
++    (void)NvsSetU32(kKeyAttempts, st25r300_get_apdu_attempts());
++    (void)NvsSetU32(kKeyFrameTrace, st25r300_get_frame_trace() ? 1 : 0);
++#endif
++    (void)NvsSetU32(kKeyApduTrace, g_apdu_trace ? 1 : 0);
++}
++
++// ---------------------------------------------------------------------------
++// Steps
++
++// Step names by INS. The CLA and INS are always printed alongside, so a wrong
++// guess here is visible rather than misleading.
++const char *StepName(uint8_t cla, uint8_t ins)
++{
++    switch (ins) {
++    case 0xA4: return "SELECT";
++    case 0x80: return cla == 0x80 ? "AUTH0" : nullptr;
++    case 0x81: return cla == 0x80 ? "AUTH1" : nullptr;
++    case 0xD1: return "LOAD_CERT";
++    case 0xC9: return "EXCHANGE";
++    case 0x3C: return "CONTROL_FLOW";
++    case 0xC3: return "ENVELOPE";
++    case 0xC0: return "GET_RESPONSE";
++    default: return nullptr;
++    }
++}
++
++void FormatStepName(const uint8_t *command, size_t command_len, char *out, size_t out_size)
++{
++    const uint8_t cla = command_len > 0 ? command[0] : 0;
++    const uint8_t ins = command_len > 1 ? command[1] : 0;
++    const char *name = StepName(cla, ins);
++    if (name) {
++        snprintf(out, out_size, "%s", name);
++    } else {
++        snprintf(out, out_size, "INS_%02X", ins);
++    }
++}
++
++uint32_t SinceSessionMs()
++{
++    return static_cast<uint32_t>((esp_timer_get_time() - g_session_start_us) / 1000);
++}
++
++bool ParseOnOff(const char *text, bool &out)
++{
++    if (text && strcmp(text, "on") == 0) {
++        out = true;
++        return true;
++    }
++    if (text && strcmp(text, "off") == 0) {
++        out = false;
++        return true;
++    }
++    return false;
++}
++
++} // namespace
++
++// ---------------------------------------------------------------------------
++// Public entry points
++
++void RingTestInit()
++{
++    if (!g_mutex) {
++        g_mutex = xSemaphoreCreateMutex();
++    }
++    LoadEndpoints();
++    uint32_t value = 0;
++    if (NvsGetU32(kKeyTrust, value)) {
++        g_trust = value == 1 ? Trust::kAny : Trust::kList;
++    }
++    if (NvsGetU32(kKeyApduTrace, value)) {
++        g_apdu_trace = value != 0;
++    }
++#if RING_HAVE_ST25R300
++    if (NvsGetU32(kKeyBudget, value)) {
++        st25r300_set_apdu_budget_ms(value);
++    }
++    if (NvsGetU32(kKeyFwt, value)) {
++        st25r300_set_fwt_floor_ms(value);
++    }
++    if (NvsGetU32(kKeyWtxCap, value)) {
++        st25r300_set_wtx_ceiling_ms(value);
++    }
++    if (NvsGetU32(kKeyAttempts, value)) {
++        st25r300_set_apdu_attempts(static_cast<uint8_t>(value));
++    }
++    if (NvsGetU32(kKeyFrameTrace, value)) {
++        st25r300_set_frame_trace(value != 0);
++    }
++#endif
++    ESP_LOGW(kTag, "RING TEST MODE ACTIVE: keys loaded over serial are TEST keys. Not for a real door. "
++                   "Type \"ring help\".");
++    ESP_LOGI(kTag, "%u endpoint key(s) loaded, trust mode %s", static_cast<unsigned>(g_endpoint_count),
++             g_trust == Trust::kList ? "list" : "any");
++}
++
++esp_err_t RingTestConfigureReader(esp_aliro_reader_handle_t reader)
++{
++    Trust trust;
++    size_t count;
++    {
++        Lock lock;
++        trust = g_trust;
++        count = g_endpoint_count;
++    }
++    if (trust == Trust::kAny) {
++        ESP_LOGW(kTag, "trust mode any: no key-slot lookup registered with esp-aliro");
++        return ESP_OK;
++    }
++    if (count == 0) {
++        ESP_LOGW(kTag, "trust mode list with no endpoint keys: every credential will be rejected at the lookup");
++    }
++    return esp_aliro_reader_enable_key_slot(reader, LookupCredentialPubkey);
++}
++
++bool RingTestHandleLine(const char *line)
++{
++    if (strncmp(line, "ring", 4) != 0 || (line[4] != '\0' && line[4] != ' ')) {
++        return false;
++    }
++    char buf[256];
++    snprintf(buf, sizeof(buf), "%s", line);
++    char *argv[6] = {};
++    int argc = 0;
++    for (char *save = nullptr, *tok = strtok_r(buf, " ", &save); tok && argc < 6; tok = strtok_r(nullptr, " ", &save)) {
++        argv[argc++] = tok;
++    }
++    const char *cmd = argc > 1 ? argv[1] : "help";
++
++    if (strcmp(cmd, "help") == 0) {
++        ShowHelp();
++    } else if (strcmp(cmd, "show") == 0) {
++        ShowSettings();
++    } else if (strcmp(cmd, "reader") == 0 && argc == 3 && strcmp(argv[2], "clear") == 0) {
++        const CHIP_ERROR err = AliroDoorLockDelegate::Instance().ClearAliroReaderConfig();
++        (void)NvsErase(kKeyPriv);
++        (void)NvsErase(kKeyGroup);
++        printf(err == CHIP_NO_ERROR ? "RING reader cleared\n" : "RING ERROR reader clear failed\n");
++    } else if (strcmp(cmd, "reader") == 0 && argc == 4) {
++        uint8_t priv[kPrivLen];
++        uint8_t group[kGroupLen];
++        if (!ParseHex(argv[2], priv, sizeof(priv)) || !ParseHex(argv[3], group, sizeof(group))) {
++            printf("RING ERROR usage: ring reader <private key, 64 hex> <group id, 32 hex>\n");
++        } else if (ApplyReader(priv, group)) {
++            const esp_err_t e1 = NvsSetBlob(kKeyPriv, priv, sizeof(priv));
++            const esp_err_t e2 = NvsSetBlob(kKeyGroup, group, sizeof(group));
++            printf("RING reader loaded (TEST KEYS)%s\n", e1 == ESP_OK && e2 == ESP_OK ? "" : ", but NVS save failed");
++            ShowReader();
++        }
++        memset(priv, 0, sizeof(priv));
++    } else if (strcmp(cmd, "endpoint") == 0 && argc == 4 && strcmp(argv[2], "add") == 0) {
++        Endpoint ep = {};
++        if (!ParseHex(argv[3], ep.pub, kPubLen) || !IsValidPublicKey(ep.pub)) {
++            printf("RING ERROR usage: ring endpoint add <uncompressed P-256 public key, 130 hex starting 04>\n");
++        } else if (!KeySlotFor(ep.pub, ep.slot, ep.slot_len)) {
++            printf("RING ERROR esp-aliro could not derive a key slot for that key\n");
++        } else {
++            bool added = false;
++            {
++                Lock lock;
++                if (g_endpoint_count < kMaxEndpoints) {
++                    g_endpoints[g_endpoint_count++] = ep;
++                    added = true;
++                }
++            }
++            if (!added) {
++                printf("RING ERROR endpoint table full (%u)\n", static_cast<unsigned>(kMaxEndpoints));
++            } else {
++                (void)StoreEndpoints();
++                PrintHexLine("RING endpoint added, key slot ", ep.slot, ep.slot_len);
++                (void)ReloadReader();
++            }
++        }
++    } else if (strcmp(cmd, "endpoint") == 0 && argc == 4 && strcmp(argv[2], "del") == 0) {
++        uint32_t index = 0;
++        bool removed = false;
++        if (ParseU32(argv[3], 0, kMaxEndpoints - 1, index)) {
++            Lock lock;
++            if (index < g_endpoint_count) {
++                for (size_t i = index; i + 1 < g_endpoint_count; ++i) {
++                    g_endpoints[i] = g_endpoints[i + 1];
++                }
++                --g_endpoint_count;
++                removed = true;
++            }
++        }
++        if (!removed) {
++            printf("RING ERROR no endpoint at that index\n");
++        } else {
++            (void)StoreEndpoints();
++            printf("RING endpoint %" PRIu32 " removed\n", index);
++            (void)ReloadReader();
++        }
++    } else if (strcmp(cmd, "endpoint") == 0 && argc == 3 && strcmp(argv[2], "clear") == 0) {
++        {
++            Lock lock;
++            g_endpoint_count = 0;
++        }
++        (void)StoreEndpoints();
++        printf("RING endpoint keys cleared\n");
++        (void)ReloadReader();
++    } else if (strcmp(cmd, "trust") == 0 && argc == 3 &&
++               (strcmp(argv[2], "list") == 0 || strcmp(argv[2], "any") == 0)) {
++        const Trust trust = strcmp(argv[2], "any") == 0 ? Trust::kAny : Trust::kList;
++        {
++            Lock lock;
++            g_trust = trust;
++        }
++        (void)NvsSetU32(kKeyTrust, trust == Trust::kAny ? 1 : 0);
++        printf("RING trust mode %s\n", argv[2]);
++        (void)ReloadReader();
++#if RING_HAVE_ST25R300
++    } else if (strcmp(cmd, "budget") == 0 && argc == 3) {
++        uint32_t ms = 0;
++        if (!ParseU32(argv[2], 100, 120000, ms)) {
++            printf("RING ERROR usage: ring budget <100..120000 ms>\n");
++        } else {
++            st25r300_set_apdu_budget_ms(ms);
++            PersistDriverKnobs();
++            printf("RING APDU budget %" PRIu32 " ms\n", st25r300_get_apdu_budget_ms());
++        }
++    } else if (strcmp(cmd, "fwt") == 0 && argc == 3) {
++        uint32_t ms = 0;
++        if (!ParseU32(argv[2], 1, 19800, ms)) {
++            printf("RING ERROR usage: ring fwt <1..19800 ms>\n");
++        } else {
++            st25r300_set_fwt_floor_ms(ms);
++            PersistDriverKnobs();
++            printf("RING FWT floor %" PRIu32 " ms\n", st25r300_get_fwt_floor_ms());
++        }
++    } else if (strcmp(cmd, "wtxcap") == 0 && argc == 3) {
++        uint32_t ms = 0;
++        if (!ParseU32(argv[2], 100, 19800, ms)) {
++            printf("RING ERROR usage: ring wtxcap <100..19800 ms>\n");
++        } else {
++            st25r300_set_wtx_ceiling_ms(ms);
++            PersistDriverKnobs();
++            printf("RING WTX ceiling %" PRIu32 " ms\n", st25r300_get_wtx_ceiling_ms());
++        }
++    } else if (strcmp(cmd, "attempts") == 0 && argc == 3) {
++        uint32_t n = 0;
++        if (!ParseU32(argv[2], 1, 5, n)) {
++            printf("RING ERROR usage: ring attempts <1..5>\n");
++        } else {
++            st25r300_set_apdu_attempts(static_cast<uint8_t>(n));
++            PersistDriverKnobs();
++            printf("RING attempts per APDU %u\n", st25r300_get_apdu_attempts());
++        }
++    } else if (strcmp(cmd, "trace") == 0 && argc == 4 && strcmp(argv[2], "frames") == 0) {
++        bool on = false;
++        if (!ParseOnOff(argv[3], on)) {
++            printf("RING ERROR usage: ring trace frames on|off\n");
++        } else {
++            st25r300_set_frame_trace(on);
++            PersistDriverKnobs();
++            printf("RING frame trace %s\n", on ? "on" : "off");
++        }
++#endif
++    } else if (strcmp(cmd, "trace") == 0 && argc == 4 && strcmp(argv[2], "apdu") == 0) {
++        bool on = false;
++        if (!ParseOnOff(argv[3], on)) {
++            printf("RING ERROR usage: ring trace apdu on|off\n");
++        } else {
++            g_apdu_trace = on;
++            PersistDriverKnobs();
++            printf("RING APDU trace %s\n", on ? "on" : "off");
++        }
++    } else if (strcmp(cmd, "reload") == 0) {
++        (void)ReloadReader();
++    } else if (strcmp(cmd, "fastclear") == 0) {
++        esp_aliro_clear_fast_transaction_storage();
++        printf("RING fast-transaction storage cleared; the next tap runs a standard transaction\n");
++    } else {
++        printf("RING ERROR unknown or malformed command; type \"ring help\"\n");
++    }
++    fflush(stdout);
++    return true;
++}
++
++void RingTestSessionBegin()
++{
++    g_session_start_us = esp_timer_get_time();
++    g_step_count = 0;
++    g_steps_dropped = 0;
++    g_transaction_type = "unknown";
++    printf("RING ---- session start ----\n");
++    fflush(stdout);
++}
++
++void RingTestBeforeExchange(const uint8_t *command, size_t command_len)
++{
++    char name[16];
++    FormatStepName(command, command_len, name, sizeof(name));
++    // Printed before the exchange, so a transaction that stalls still says
++    // which command the card is sitting on.
++    printf("RING t=%" PRIu32 " ms > %s CLA=%02X INS=%02X len=%u\n", SinceSessionMs(), name,
++           command_len > 0 ? command[0] : 0, command_len > 1 ? command[1] : 0, static_cast<unsigned>(command_len));
++    if (g_apdu_trace) {
++        PrintHexDump("RING   > ", command, command_len);
++    }
++    fflush(stdout);
++}
++
++void RingTestAfterExchange(const uint8_t *command, size_t command_len, const uint8_t *response,
++                           size_t response_len, esp_err_t err, int64_t elapsed_us)
++{
++    Step step = {};
++    FormatStepName(command, command_len, step.name, sizeof(step.name));
++    step.cla = command_len > 0 ? command[0] : 0;
++    step.ins = command_len > 1 ? command[1] : 0;
++    step.ms = static_cast<uint32_t>(elapsed_us / 1000);
++    step.command_len = command_len;
++    step.response_len = err == ESP_OK ? response_len : 0;
++    step.sw = err == ESP_OK && response_len >= 2
++        ? static_cast<uint16_t>((response[response_len - 2] << 8) | response[response_len - 1])
++        : 0;
++    step.err = err;
++    step.last_frame = "";
++#if RING_HAVE_ST25R300
++    st25r300_apdu_stats_t stats = {};
++    st25r300_get_last_apdu_stats(&stats);
++    step.wtx = stats.wtx;
++    step.budget_exceeded = stats.budget_exceeded;
++    step.wtx_limit = stats.wtx_limit;
++    step.last_frame = stats.last_frame ? stats.last_frame : "";
++#endif
++    if (g_step_count < kMaxSteps) {
++        g_steps[g_step_count++] = step;
++    } else {
++        ++g_steps_dropped;
++    }
++
++    if (err == ESP_OK) {
++        printf("RING t=%" PRIu32 " ms < %s %" PRIu32 " ms, rsp len=%u SW=%04X, WTX=%" PRIu32 "\n", SinceSessionMs(),
++               step.name, step.ms, static_cast<unsigned>(response_len), step.sw, step.wtx);
++        if (g_apdu_trace) {
++            PrintHexDump("RING   < ", response, response_len);
++        }
++    } else {
++        printf("RING t=%" PRIu32 " ms < %s FAILED after %" PRIu32 " ms: %s, WTX=%" PRIu32 ", last frame %s%s%s\n",
++               SinceSessionMs(), step.name, step.ms, esp_err_to_name(err), step.wtx, step.last_frame,
++               step.budget_exceeded ? ", APDU BUDGET EXCEEDED" : "", step.wtx_limit ? ", WTX LIMIT HIT" : "");
++    }
++    fflush(stdout);
++}
++
++void RingTestNoteTransactionType(esp_aliro_session_handle_t session)
++{
++    esp_aliro_transaction_type_t type;
++    if (esp_aliro_session_get_transaction_type(session, &type) == ESP_OK) {
++        g_transaction_type = type == ESP_ALIRO_TRANSACTION_FAST ? "FAST" : "STANDARD";
++    }
++}
++
++void RingTestSessionEnd(esp_err_t err, const char *phase)
++{
++    const uint32_t total_ms = SinceSessionMs();
++    if (err == ESP_OK) {
++        printf("RING ==== RESULT OK in %" PRIu32 " ms (%u APDUs, %s transaction)\n", total_ms,
++               static_cast<unsigned>(g_step_count), g_transaction_type);
++    } else {
++        printf("RING ==== RESULT FAIL in phase %s after %" PRIu32 " ms: %s (%s transaction)\n",
++               phase ? phase : "?", total_ms, esp_err_to_name(err), g_transaction_type);
++    }
++    for (size_t i = 0; i < g_step_count; ++i) {
++        const Step &s = g_steps[i];
++        if (s.err == ESP_OK) {
++            printf("RING   %2u %-13s %7" PRIu32 " ms  SW=%04X  cmd=%u rsp=%u  WTX=%" PRIu32 "\n",
++                   static_cast<unsigned>(i), s.name, s.ms, s.sw, static_cast<unsigned>(s.command_len),
++                   static_cast<unsigned>(s.response_len), s.wtx);
++        } else {
++            printf("RING   %2u %-13s %7" PRIu32 " ms  TRANSPORT FAILED (%s)  WTX=%" PRIu32 "\n",
++                   static_cast<unsigned>(i), s.name, s.ms, esp_err_to_name(s.err), s.wtx);
++        }
++    }
++    if (g_steps_dropped) {
++        printf("RING   (%u further APDUs not listed)\n", static_cast<unsigned>(g_steps_dropped));
++    }
++
++    if (err != ESP_OK) {
++        // Say where it stopped and what to try, from what the transport saw.
++        if (g_step_count == 0) {
++            printf("RING   diagnosis: failed before any APDU (session setup). Is a reader loaded? \"ring show\"\n");
++        } else {
++            const Step &last = g_steps[g_step_count - 1];
++            if (last.err != ESP_OK) {
++                if (last.budget_exceeded) {
++                    printf("RING   diagnosis: %s was still running when the APDU budget ran out. "
++                           "Try \"ring budget 60000\".\n", last.name);
++                } else if (last.wtx_limit) {
++                    printf("RING   diagnosis: %s asked for time more often than the WTX backstop allows.\n",
++                           last.name);
++                } else if (strcmp(last.last_frame, "timeout") == 0 && last.wtx == 0) {
++                    printf("RING   diagnosis: no answer to %s within the frame waiting time and no S(WTX) "
++                           "from the card. If the applet computes without WTX, try \"ring fwt 5000\".\n",
++                           last.name);
++                } else if (strcmp(last.last_frame, "timeout") == 0) {
++                    printf("RING   diagnosis: the card stopped answering during %s after %" PRIu32
++                           " WTX grants: field lost (ring moved?) or the card reset. \"ring trace frames on\" "
++                           "shows the last frames.\n", last.name, last.wtx);
++                } else if (strcmp(last.last_frame, "ok") == 0) {
++                    printf("RING   diagnosis: every frame of %s arrived, but the ISO-DEP exchange did not "
++                           "complete: a response larger than the library buffer, R(NAK), S(DESELECT) or a "
++                           "chaining error. \"ring trace frames on\" shows which.\n", last.name);
++                } else {
++                    printf("RING   diagnosis: RF error during %s (last frame %s). Check coupling and "
++                           "position.\n", last.name, last.last_frame);
++                }
++            } else if (last.sw != 0x9000) {
++                printf("RING   diagnosis: the card answered %s with SW=%04X and esp-aliro stopped there.\n",
++                       last.name, last.sw);
++            } else {
++                printf("RING   diagnosis: %s completed with SW=9000 but esp-aliro rejected its content "
++                       "(see its error line above: signature, key slot, decryption).\n", last.name);
++            }
++        }
++    }
++    fflush(stdout);
++}
++
++#endif // CONFIG_ALIRO_RING_TEST_MODE
+diff --git a/examples/door_lock/main/aliro_ring_test.h b/examples/door_lock/main/aliro_ring_test.h
+new file mode 100644
+index 0000000..5ce0ecc
+--- /dev/null
++++ b/examples/door_lock/main/aliro_ring_test.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++// Ring applet test mode (patch 0027).
++//
++// Lets an Aliro credential developer run their applet against this reader
++// without a phone or a Matter commissioner: reader keys and credential
++// endpoint public keys are loaded over the USB serial console and kept in NVS,
++// every APDU is timed and can be traced in hex, and the NFC driver's slow-card
++// limits can be changed at run time. Built only with
++// CONFIG_ALIRO_RING_TEST_MODE=y. Keys loaded this way are TEST keys.
++
++#include <sdkconfig.h>
++
++#include <esp_aliro.h>
++#include <esp_err.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#if CONFIG_ALIRO_RING_TEST_MODE
++
++// Load the stored test settings and push the slow-card knobs into the NFC
++// driver. Call after m5nfc_init() and esp_aliro_init().
++void RingTestInit();
++
++// Called on every new reader handle, after esp_aliro_reader_create() and
++// before esp_aliro_reader_enable(): registers the endpoint key lookup when the
++// trust mode is "list".
++esp_err_t RingTestConfigureReader(esp_aliro_reader_handle_t reader);
++
++// One serial console line. Returns true when the line was a "ring" command
++// and has been handled.
++bool RingTestHandleLine(const char *line);
++
++// Transaction instrumentation, called from the NFC task.
++void RingTestSessionBegin();
++void RingTestBeforeExchange(const uint8_t *command, size_t command_len);
++void RingTestAfterExchange(const uint8_t *command, size_t command_len, const uint8_t *response,
++                           size_t response_len, esp_err_t err, int64_t elapsed_us);
++void RingTestNoteTransactionType(esp_aliro_session_handle_t session);
++void RingTestSessionEnd(esp_err_t err, const char *phase);
++
++#endif
+diff --git a/examples/door_lock/main/aliro_settings.cpp b/examples/door_lock/main/aliro_settings.cpp
+index 828a405..c43ab7a 100644
+--- a/examples/door_lock/main/aliro_settings.cpp
++++ b/examples/door_lock/main/aliro_settings.cpp
+@@ -11,6 +11,10 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#if CONFIG_ALIRO_RING_TEST_MODE
++#include "aliro_ring_test.h"
++#endif
++
+ using namespace chip::app::Clusters;
+ 
+ namespace {
+@@ -142,6 +146,11 @@ esp_err_t ApplySettings(const AliroSettingsSnapshot &candidate, bool &storage_er
+ 
+ void ProcessLine(char *line)
+ {
++#if CONFIG_ALIRO_RING_TEST_MODE
++    if (RingTestHandleLine(line)) {
++        return;
++    }
++#endif
+     AliroParsedRequest request;
+     AliroParseError parse_error = AliroParseRequest(line, AliroSettingsGet(), request);
+     if (parse_error != AliroParseError::kNone) {
+diff --git a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+index 487c738..d648d50 100644
+--- a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
++++ b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+@@ -30,6 +30,9 @@
+ 
+ #include "aliro_door_lock_delegate.h"
+ #include "aliro_settings.h"
++#if CONFIG_ALIRO_RING_TEST_MODE
++#include "aliro_ring_test.h"
++#endif
+ #include "door_lock_manager.h"
+ 
+ using namespace chip;
+@@ -444,6 +447,9 @@ CHIP_ERROR AliroDoorLockDelegate::SetAliroReaderConfig(const ByteSpan  &signingK
+     memcpy(reader_config.group_identifier, groupIdentifier.data(), groupIdentifier.size());
+ 
+     ReturnErrorOnFailure(ESP32Utils::MapError(esp_aliro_reader_create(&m_aliro_reader, &reader_config)));
++#if CONFIG_ALIRO_RING_TEST_MODE
++    ReturnErrorOnFailure(ESP32Utils::MapError(RingTestConfigureReader(m_aliro_reader)));
++#endif
+     ReturnErrorOnFailure(ESP32Utils::MapError(esp_aliro_reader_enable(m_aliro_reader)));
+     ReturnErrorOnFailure(ESP32Utils::MapError(m5nfc_set_ecp_identifier(groupIdentifier.data(), 8)));
+     ReturnErrorOnFailure(ESP32Config::WriteConfigValueBin(kAliroGroupId, groupIdentifier.data(), groupIdentifier.size()));
+@@ -472,7 +478,15 @@ esp_err_t AliroDoorLockDelegate::NfcMessageExchange(const uint8_t *command, size
+                                                     size_t *response_len)
+ {
+     const bool is_aliro_select = IsAliroSelectCommand(command, command_len);
++#if CONFIG_ALIRO_RING_TEST_MODE
++    RingTestBeforeExchange(command, command_len);
++    const int64_t ring_start_us = esp_timer_get_time();
++#endif
+     esp_err_t err = m5nfc_message_exchange(command, command_len, response, response_len);
++#if CONFIG_ALIRO_RING_TEST_MODE
++    RingTestAfterExchange(command, command_len, response, response_len ? *response_len : 0, err,
++                          esp_timer_get_time() - ring_start_us);
++#endif
+     if (is_aliro_select) {
+         g_aliro_applet_selected =
+             err == ESP_OK && response_len && IsSuccessfulAliroSelectResponse(response, *response_len);
+@@ -533,6 +547,10 @@ void AliroDoorLockDelegate::NfcDetectTask(void *delegate)
+             g_aliro_select_rejected = false;
+             g_aliro_applet_selected = false;
+             session_start_us = esp_timer_get_time();
++#if CONFIG_ALIRO_RING_TEST_MODE
++            RingTestSessionBegin();
++            const char *ring_phase = "session_create";
++#endif
+             esp_aliro_session_config_t session_cfg = {
+                 .aid_type = ESP_ALIRO_NFC_AID_EXPEDITED_PHASE,
+                 .auth_policy = ESP_ALIRO_AUTH_POLICY_USER_DEVICE_SETTING_SECURE_ACTION,
+@@ -540,14 +558,28 @@ void AliroDoorLockDelegate::NfcDetectTask(void *delegate)
+             esp_aliro_session_handle_t session = 0;
+             err = esp_aliro_session_create(doorLockDelegate->m_aliro_reader, &session, &session_cfg);
+             if (err == ESP_OK) {
++#if CONFIG_ALIRO_RING_TEST_MODE
++                ring_phase = "expedited";
++#endif
+                 err = esp_aliro_session_run_expedited(session, NfcMessageExchange);
+             }
+             if (err == ESP_OK) {
++#if CONFIG_ALIRO_RING_TEST_MODE
++                ring_phase = "exchange";
++#endif
+                 err = esp_aliro_session_run_exchange(session, NfcMessageExchange, ESP_ALIRO_CRYPTO_ENGINE_EXPEDITED);
+             }
++#if CONFIG_ALIRO_RING_TEST_MODE
++            if (session) {
++                RingTestNoteTransactionType(session);
++            }
++#endif
+             if (session) {
+                 (void)esp_aliro_session_delete(&session);
+             }
++#if CONFIG_ALIRO_RING_TEST_MODE
++            RingTestSessionEnd(err, ring_phase);
++#endif
+         }
+         const int64_t session_time_ms = (esp_timer_get_time() - session_start_us) / 1000;
+         if (err == ESP_OK) {
+@@ -602,6 +634,9 @@ esp_err_t AliroDoorLockDelegate::Init()
+         .fast_transaction_storage_size = 10,
+     };
+     ESP_RETURN_ON_ERROR(esp_aliro_init(&aliro_config), "Aliro", "Failed to init aliro");
++#if CONFIG_ALIRO_RING_TEST_MODE
++    RingTestInit();
++#endif
+ 
+     esp_aliro_reader_config_t reader_config = {
+         .group_identifier = {0},
+@@ -641,6 +676,9 @@ esp_err_t AliroDoorLockDelegate::Init()
+     reader_config.reader_privkey = privkey_pem_buf;
+ 
+     ESP_RETURN_ON_ERROR(esp_aliro_reader_create(&m_aliro_reader, &reader_config), "Aliro", "Failed to create reader");
++#if CONFIG_ALIRO_RING_TEST_MODE
++    ESP_RETURN_ON_ERROR(RingTestConfigureReader(m_aliro_reader), "Aliro", "Failed to configure ring test lookup");
++#endif
+     ESP_RETURN_ON_ERROR(esp_aliro_reader_enable(m_aliro_reader), "Aliro", "Failed to enable reader");
+     ESP_RETURN_ON_ERROR(m5nfc_set_ecp_identifier(reader_config.group_identifier, 8), "Aliro",
+                         "Failed to configure Aliro ECP identifier");

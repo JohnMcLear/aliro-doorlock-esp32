@@ -111,6 +111,7 @@ keys = [
     "nfc_spi_mosi_gpio",
     "nfc_spi_cs_gpio",
     "nfc_irq_gpio",
+    "nfc_rst_gpio",
     "_esp_matter_pin",
     "_connectedhomeip_pin",
     "_release_tag_pattern",
@@ -198,11 +199,12 @@ done
 BOARD_CONFIG_HEADER="$REPO_ROOT/$VARIANT_BOARD_CONFIG_HEADER"
 # The NFC driver defaults to the audited M5 Unit NFC path (managed m5nfc
 # plus patch 0005). st25r3916-spi builds firmware/components/st25r3916_spi
+# and st25r300-spi builds firmware/components/st25r300_spi; either is
 # instead, handed to the door-lock CMakeLists through its
 # extra_components_dirs_append hook, so nothing is copied into esp-matter.
 VARIANT_NFC_DRIVER="${VARIANT_NFC_DRIVER:-m5nfc-i2c}"
 case "$VARIANT_NFC_DRIVER" in
-  m5nfc-i2c|st25r3916-spi) ;;
+  m5nfc-i2c|st25r3916-spi|st25r300-spi) ;;
   *) echo "error: variant $VARIANT_ID has unknown nfc_driver '$VARIANT_NFC_DRIVER'" >&2; exit 2 ;;
 esac
 EXTRA_COMPONENT_DIRS=""
@@ -638,11 +640,19 @@ validate_nanoc6_nfc_feedback() {
 }
 
 validate_variant_nfc_spi_map() {
-  # For the SPI reader, variants.json, the board header and the overlay's
-  # Kconfig values must name the same five GPIOs.
-  if [[ "$VARIANT_NFC_DRIVER" != "st25r3916-spi" ]]; then
-    return 0
-  fi
+  # For an SPI reader, variants.json, the board header and the overlay's
+  # Kconfig values must name the same GPIOs: five for the ST25R3916, six for
+  # the ST25R300, which also has a RESET line.
+  local prefix
+  local pins=()
+  case "$VARIANT_NFC_DRIVER" in
+    st25r3916-spi) prefix="CONFIG_ST25R3916_SPI_PIN" ;;
+    st25r300-spi)
+      prefix="CONFIG_ST25R300_SPI_PIN"
+      pins+=("$VARIANT_NFC_RST_GPIO:ALIRO_BOARD_NFC_RST_GPIO:${prefix}_RST")
+      ;;
+    *) return 0 ;;
+  esac
   local header="$BOARD_CONFIG_HEADER"
   local pair
   local json_value
@@ -651,11 +661,12 @@ validate_variant_nfc_spi_map() {
   local header_value
   local overlay_value
   for pair in \
-      "$VARIANT_NFC_SPI_SCLK_GPIO:ALIRO_BOARD_NFC_SPI_SCLK_GPIO:CONFIG_ST25R3916_SPI_PIN_SCLK" \
-      "$VARIANT_NFC_SPI_MISO_GPIO:ALIRO_BOARD_NFC_SPI_MISO_GPIO:CONFIG_ST25R3916_SPI_PIN_MISO" \
-      "$VARIANT_NFC_SPI_MOSI_GPIO:ALIRO_BOARD_NFC_SPI_MOSI_GPIO:CONFIG_ST25R3916_SPI_PIN_MOSI" \
-      "$VARIANT_NFC_SPI_CS_GPIO:ALIRO_BOARD_NFC_SPI_CS_GPIO:CONFIG_ST25R3916_SPI_PIN_CS" \
-      "$VARIANT_NFC_IRQ_GPIO:ALIRO_BOARD_NFC_IRQ_GPIO:CONFIG_ST25R3916_SPI_PIN_IRQ"; do
+      "$VARIANT_NFC_SPI_SCLK_GPIO:ALIRO_BOARD_NFC_SPI_SCLK_GPIO:${prefix}_SCLK" \
+      "$VARIANT_NFC_SPI_MISO_GPIO:ALIRO_BOARD_NFC_SPI_MISO_GPIO:${prefix}_MISO" \
+      "$VARIANT_NFC_SPI_MOSI_GPIO:ALIRO_BOARD_NFC_SPI_MOSI_GPIO:${prefix}_MOSI" \
+      "$VARIANT_NFC_SPI_CS_GPIO:ALIRO_BOARD_NFC_SPI_CS_GPIO:${prefix}_CS" \
+      "$VARIANT_NFC_IRQ_GPIO:ALIRO_BOARD_NFC_IRQ_GPIO:${prefix}_IRQ" \
+      ${pins[@]+"${pins[@]}"}; do
     json_value="${pair%%:*}"
     macro="${pair#*:}"; macro="${macro%%:*}"
     kconfig="${pair##*:}"
@@ -666,7 +677,7 @@ validate_variant_nfc_spi_map() {
       return 2
     fi
   done
-  echo "=== NFC SPI map ($VARIANT_ID): SCLK $VARIANT_NFC_SPI_SCLK_GPIO MISO $VARIANT_NFC_SPI_MISO_GPIO MOSI $VARIANT_NFC_SPI_MOSI_GPIO CS $VARIANT_NFC_SPI_CS_GPIO IRQ $VARIANT_NFC_IRQ_GPIO match header and overlay ==="
+  echo "=== NFC SPI map ($VARIANT_ID): SCLK $VARIANT_NFC_SPI_SCLK_GPIO MISO $VARIANT_NFC_SPI_MISO_GPIO MOSI $VARIANT_NFC_SPI_MOSI_GPIO CS $VARIANT_NFC_SPI_CS_GPIO IRQ $VARIANT_NFC_IRQ_GPIO${VARIANT_NFC_RST_GPIO:+ RST $VARIANT_NFC_RST_GPIO} match header and overlay ==="
 }
 
 validate_st25r3916_spi_driver() {
@@ -782,6 +793,129 @@ validate_st25r3916_spi_driver() {
   fi
   command rm -f "$test_binary"
   echo "=== st25r3916_spi: source contract, frame logic test and 23 ISO-DEP tests passed ==="
+}
+
+validate_st25r300_spi_driver() {
+  # Source contract for firmware/components/st25r300_spi, its host test, and
+  # the shared ST25R3916 frame logic and ISO-DEP headers it compiles against.
+  if [[ "$VARIANT_NFC_DRIVER" != "st25r300-spi" ]]; then
+    return 0
+  fi
+  local component="$REPO_ROOT/firmware/components/st25r300_spi"
+  local shared="$REPO_ROOT/firmware/components/st25r3916_spi"
+  local driver="$component/src/st25r300_spi_nfc.cpp"
+  local isodep_dir="$shared/third_party/yondoor_isodep"
+  local required_text
+  local ecp_line
+  local request_line
+  local file
+  local expected
+  local actual
+  local test_binary
+
+  for required_text in \
+      'esp_err_t m5nfc_init(void);' \
+      'esp_err_t m5nfc_set_ecp_identifier(const uint8_t *identifier, size_t identifier_len);' \
+      'esp_err_t m5nfc_message_exchange(const uint8_t *command, size_t command_len, uint8_t *response, size_t *response_len);' \
+      'M5NFC_ACTIVATION_NON_ISO_DEP'; do
+    if ! grep -Fq "$required_text" "$component/include/m5nfc.h"; then
+      echo "error: st25r300_spi m5nfc.h is missing: $required_text" >&2
+      return 2
+    fi
+  done
+  for required_text in \
+      'constexpr uint32_t kEcpResponseTimeoutMs = 12;' \
+      'constexpr uint32_t kEcpSettleTimeMs = 5;' \
+      'st25r3916::build_ecp_frame(clear ? nullptr : identifier, frame.data());' \
+      'esphome::st25r::isodep_exchange_apdu(' \
+      'send_frame_absorbing_wtx(' \
+      'st25r3916::enumerate_tags(ops, tags, kMaxTagsPerPoll, enumeration)' \
+      'command(kCmdClearFifo)' \
+      'return M5NFC_ACTIVATION_NON_ISO_DEP;'; do
+    if ! grep -Fq "$required_text" "$driver"; then
+      echo "error: st25r300_spi driver is missing: $required_text" >&2
+      return 2
+    fi
+  done
+  # STOP_ALL turns the receiver off; a transmission must never follow one.
+  if grep -Fq 'command(kCmdStopAll)' "$driver"; then
+    echo "error: st25r300_spi must clear the FIFO with CLEAR_FIFO, not STOP_ALL" >&2
+    return 2
+  fi
+  ecp_line="$(grep -n -F 'if (send_aliro_ecp())' "$driver" | cut -d: -f1)"
+  request_line="$(grep -n -F 'if (!poll_a(atqa))' "$driver" | cut -d: -f1)"
+  if [[ -z "$ecp_line" || -z "$request_line" || "$ecp_line" -ge "$request_line" ]]; then
+    echo "error: Aliro ECP must run before the NFC-A poll" >&2
+    return 2
+  fi
+  for file in isodep_apdu.h isodep_wtx.h; do
+    expected="$(awk -v f="$file" '$2==f {print $1}' "$isodep_dir/PROVENANCE.txt")"
+    actual="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$isodep_dir/$file")"
+    if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+      echo "error: $file differs from the copy recorded in PROVENANCE.txt" >&2
+      return 2
+    fi
+  done
+
+  test_binary="$(mktemp "${TMPDIR:-/tmp}/st25r300-logic.XXXXXX")"
+  if ! "${CXX:-c++}" -std=gnu++17 -Wall -Wextra -Werror -I "$component/src" \
+      "$REPO_ROOT/firmware/tests/st25r300_logic_test.cpp" -o "$test_binary" || ! "$test_binary"; then
+    command rm -f "$test_binary"
+    echo "error: st25r300 logic host test failed" >&2
+    return 2
+  fi
+  command rm -f "$test_binary"
+  test_binary="$(mktemp "${TMPDIR:-/tmp}/st25r3916-frame-logic.XXXXXX")"
+  if ! "${CXX:-c++}" -std=gnu++17 -Wall -Wextra -Werror -I "$shared/src" \
+      "$REPO_ROOT/firmware/tests/st25r3916_frame_logic_test.cpp" -o "$test_binary" || ! "$test_binary"; then
+    command rm -f "$test_binary"
+    echo "error: shared frame logic host test failed" >&2
+    return 2
+  fi
+  command rm -f "$test_binary"
+  test_binary="$(mktemp "${TMPDIR:-/tmp}/isodep-test.XXXXXX")"
+  if ! "${CXX:-c++}" -std=c++11 -Wall -Wextra -Werror -I "$isodep_dir" \
+      "$REPO_ROOT/firmware/tests/isodep/test_isodep.cpp" -o "$test_binary" || ! "$test_binary" >/dev/null; then
+    command rm -f "$test_binary"
+    echo "error: ISO-DEP host tests failed" >&2
+    return 2
+  fi
+  command rm -f "$test_binary"
+  echo "=== st25r300_spi: source contract, WTX budget test, shared frame logic test and ISO-DEP tests passed ==="
+}
+
+validate_ring_test_mode() {
+  # Patch 0027 must only ever ship in a variant whose overlay switches it on,
+  # and such an overlay must carry the patch, or the "ring" console commands
+  # would be missing or, worse, half present.
+  local patch_listed=0
+  local overlay_on=0
+  local rel
+  for rel in "${VARIANT_SOURCE_PATCHES[@]}"; do
+    if [[ "$rel" == *"0027-ring-applet-test-mode.patch" ]]; then
+      patch_listed=1
+    fi
+  done
+  if grep -Fxq 'CONFIG_ALIRO_RING_TEST_MODE=y' "$OVERLAY"; then
+    overlay_on=1
+  fi
+  if [[ "$patch_listed" != "$overlay_on" ]]; then
+    echo "error: $VARIANT_ID: patch 0027 listed=$patch_listed but CONFIG_ALIRO_RING_TEST_MODE=y in overlay=$overlay_on" >&2
+    return 2
+  fi
+  if [[ "$overlay_on" == "1" ]]; then
+    for rel in aliro_ring_test.cpp aliro_ring_test.h; do
+      if [[ ! -f "$APP_DIR/main/$rel" ]]; then
+        echo "error: ring test mode source $rel missing after patching" >&2
+        return 2
+      fi
+    done
+    if [[ "$VARIANT_ID" != *ringtest* ]]; then
+      echo "error: ring test mode is only allowed in a variant whose id says ringtest" >&2
+      return 2
+    fi
+    echo "=== Ring applet test mode: ON for $VARIANT_ID (TEST KEYS ONLY) ==="
+  fi
 }
 
 validate_st25r3916_spi_dependencies() {
@@ -911,6 +1045,8 @@ validate_variant_transport_exclusivity
 validate_variant_board_map
 validate_variant_nfc_spi_map
 validate_st25r3916_spi_driver
+validate_st25r300_spi_driver
+validate_ring_test_mode
 
 if [[ "$SOURCE_CHECK_ONLY" == "1" ]]; then
   echo "=== Source patch check complete for variant $VARIANT_ID; idf.py was not run ==="

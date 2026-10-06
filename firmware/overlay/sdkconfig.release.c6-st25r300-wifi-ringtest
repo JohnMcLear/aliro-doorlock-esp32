@@ -1,0 +1,55 @@
+# Release overlay for the c6-st25r300-wifi-ringtest bench variant: an ESP32-C6
+# devkit wired to an ST25R300 reader board over SPI, with the ring applet test
+# mode switched on.
+#
+# WHY THIS EXISTS. VivoKey are building an Aliro Java Card applet for a ring
+# (NXP J3R180/J3R452, AES-GCM in software, 10 s or more per transaction). They
+# need a reader they can provision with TEST keys over USB serial, without a
+# phone or a Matter commissioner, that tolerates a slow card and shows where a
+# transaction stalls. See docs/ring-applet-test-mode.md.
+#
+# Layered on examples/door_lock/sdkconfig.esp32c6.aliro, like the other C6
+# variants. The transport block and the BLE fix are the c6-steval-wifi ones:
+# Matter still runs, and can still commission the board, but nothing in the
+# test mode needs it.
+
+# --- Ring applet test mode (patch 0027) -----------------------------------
+CONFIG_ALIRO_RING_TEST_MODE=y
+
+# --- BOOT button on GPIO 9, active-low -----------------------------------
+CONFIG_BSP_BUTTONS_NUM=1
+CONFIG_BSP_BUTTON_1_TYPE_GPIO=y
+CONFIG_BSP_BUTTON_1_GPIO=9
+CONFIG_BSP_BUTTON_1_LEVEL=0
+
+# --- No BSP LEDs: the Aliro source drives the WS2812 on GPIO 8 itself -----
+CONFIG_BSP_LEDS_NUM=0
+
+# --- Native USB console (USB Serial/JTAG, 303a:1001, /dev/ttyACM*) --------
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# --- ST25R300 on SPI (st25r300_spi component) ------------------------------
+# Must match firmware/board_config/c6_st25r300.h and variants.json.
+CONFIG_ST25R300_SPI_HOST=1
+CONFIG_ST25R300_SPI_PIN_SCLK=19
+CONFIG_ST25R300_SPI_PIN_MISO=20
+CONFIG_ST25R300_SPI_PIN_MOSI=21
+CONFIG_ST25R300_SPI_PIN_CS=22
+CONFIG_ST25R300_SPI_PIN_IRQ=23
+CONFIG_ST25R300_SPI_PIN_RST=18
+CONFIG_ST25R300_SPI_FREQ_HZ=1000000
+
+# Slow-card defaults. All four can be changed at run time with the "ring"
+# serial commands; these are what a fresh board starts with.
+CONFIG_ST25R300_FWT_FLOOR_MS=100
+CONFIG_ST25R300_WTX_CEILING_MS=5000
+CONFIG_ST25R300_APDU_BUDGET_MS=30000
+CONFIG_ST25R300_APDU_ATTEMPTS=1
+
+# --- Transport: Wi-Fi station on, OpenThread off ---------------------------
+CONFIG_ENABLE_WIFI_STATION=y
+CONFIG_OPENTHREAD_ENABLED=n
+
+# --- CHIPoBLE indication confirmations (see the c6-steval-wifi overlay) ------
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_GATT_CLIENT=y
