@@ -1,0 +1,153 @@
+diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_main.cpp
+index 6e5d5b0..96a43e0 100644
+--- a/examples/door_lock/main/app_main.cpp
++++ b/examples/door_lock/main/app_main.cpp
+@@ -21,6 +21,12 @@
+ #include <app_priv.h>
+ #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
+ #include <platform/ESP32/OpenthreadLauncher.h>
++#include <esp_openthread.h>
++#include <esp_openthread_lock.h>
++#include <openthread/instance.h>
++#include <openthread/ip6.h>
++#include <openthread/netdata.h>
++#include <openthread/thread.h>
+ #endif
+ 
+ #include <app/server/CommissioningWindowManager.h>
+@@ -48,6 +53,127 @@
+ static const uint16_t s_decryption_key_len = decryption_key_end - decryption_key_start;
+ #endif // CONFIG_ENABLE_ENCRYPTED_OTA
+ 
++// Thread reachability diagnostics, added 2026-09-21.
++//
++// Six Apple Home attempts across three networks all failed the same way: BLE,
++// PASE, attestation and AddNOC all succeed, the board attaches as a child of
++// the Apple TV, SRP registration is acked, SLAAC gives it a routable address,
++// and then not one inbound packet ever arrives on that address. Commissioning
++// times out on the fail-safe.
++//
++// Two candidates remained, and neither could be separated from the child's side
++// with the logs available: the border router not forwarding inbound into the
++// mesh, or this device never registering its routable address with its parent.
++// The OpenThread CLI would answer it in seconds and is not reachable, because
++// the serial console belongs to the Aliro protocol handler.
++//
++// So the device reports it itself: role, link mode, parent, every address it
++// holds, and whether network data carries an on-mesh prefix to be reached on.
++// It also nudges the child timeout once a routable address appears, which makes
++// OpenThread send a Child Update Request carrying the Address Registration TLV.
++// If inbound traffic starts working after that nudge, the registration was the
++// problem, and that is worth knowing before anyone blames Apple.
++namespace {
++
++constexpr const char *kDiagTag = "thread_diag";
++bool g_diag_nudged = false;
++
++const char *diag_role_name(otDeviceRole role)
++{
++    switch (role) {
++    case OT_DEVICE_ROLE_DISABLED: return "disabled";
++    case OT_DEVICE_ROLE_DETACHED: return "detached";
++    case OT_DEVICE_ROLE_CHILD:    return "child";
++    case OT_DEVICE_ROLE_ROUTER:   return "router";
++    case OT_DEVICE_ROLE_LEADER:   return "leader";
++    default:                      return "unknown";
++    }
++}
++
++void diag_dump_once()
++{
++    esp_openthread_lock_acquire(portMAX_DELAY);
++    otInstance *inst = esp_openthread_get_instance();
++    if (inst == nullptr) {
++        esp_openthread_lock_release();
++        return;
++    }
++
++    const otDeviceRole role = otThreadGetDeviceRole(inst);
++    const otLinkModeConfig mode = otThreadGetLinkMode(inst);
++    ESP_LOGW(kDiagTag, "role=%s rx-on-when-idle=%d full-thread-device=%d full-network-data=%d "
++                       "child-timeout=%us poll=%ums",
++             diag_role_name(role), mode.mRxOnWhenIdle, mode.mDeviceType, mode.mNetworkData,
++             (unsigned) otThreadGetChildTimeout(inst), (unsigned) otLinkGetPollPeriod(inst));
++
++    if (role == OT_DEVICE_ROLE_CHILD) {
++        otRouterInfo parent = {};
++        int8_t parent_rssi = 0;
++        const bool have_parent = otThreadGetParentInfo(inst, &parent) == OT_ERROR_NONE;
++        const bool have_rssi = otThreadGetParentAverageRssi(inst, &parent_rssi) == OT_ERROR_NONE;
++        if (have_parent) {
++            ESP_LOGW(kDiagTag, "parent rloc16=0x%04x link-quality-in=%u age=%us rssi=%d",
++                     parent.mRloc16, parent.mLinkQualityIn, (unsigned) parent.mAge,
++                     have_rssi ? parent_rssi : 0);
++        }
++    }
++
++    // Every address this device holds. The routable one is what a commissioner
++    // has to reach, so if it is missing the rest of the story does not matter.
++    bool has_routable = false;
++    for (const otNetifAddress *addr = otIp6GetUnicastAddresses(inst); addr != nullptr; addr = addr->mNext) {
++        char buf[OT_IP6_ADDRESS_STRING_SIZE];
++        otIp6AddressToString(&addr->mAddress, buf, sizeof(buf));
++        const bool routable = addr->mAddress.mFields.m8[0] != 0xfe;  // not link-local
++        const bool mesh_local = routable && addr->mAddress.mFields.m8[0] == 0xfd && addr->mRloc;
++        if (routable && !mesh_local && !addr->mRloc) {
++            has_routable = true;
++        }
++        ESP_LOGW(kDiagTag, "addr %s/%u %s%s%s", buf, addr->mPrefixLength, addr->mPreferred ? "preferred " : "",
++                 addr->mValid ? "valid " : "", addr->mRloc ? "rloc " : "");
++    }
++
++    // Network data says whether anything is offering a prefix to be reached on
++    // and a route off the mesh. No default route means no commissioner can get in.
++    otNetworkDataIterator it = OT_NETWORK_DATA_ITERATOR_INIT;
++    otBorderRouterConfig cfg;
++    unsigned prefixes = 0, default_routes = 0;
++    while (otNetDataGetNextOnMeshPrefix(inst, &it, &cfg) == OT_ERROR_NONE) {
++        char buf[OT_IP6_ADDRESS_STRING_SIZE];
++        otIp6AddressToString(&cfg.mPrefix.mPrefix, buf, sizeof(buf));
++        ESP_LOGW(kDiagTag, "netdata prefix %s/%u rloc16=0x%04x slaac=%d default-route=%d on-mesh=%d",
++                 buf, cfg.mPrefix.mLength, cfg.mRloc16, cfg.mSlaac, cfg.mDefaultRoute, cfg.mOnMesh);
++        prefixes++;
++        if (cfg.mDefaultRoute) {
++            default_routes++;
++        }
++    }
++    ESP_LOGW(kDiagTag, "netdata on-mesh prefixes=%u with-default-route=%u routable-address=%d",
++             prefixes, default_routes, has_routable ? 1 : 0);
++
++    // One nudge, once, once there is something to register. Setting the child
++    // timeout to its own value is enough to make OpenThread send a Child Update
++    // Request, which carries the Address Registration TLV.
++    if (has_routable && role == OT_DEVICE_ROLE_CHILD && !g_diag_nudged) {
++        g_diag_nudged = true;
++        otThreadSetChildTimeout(inst, otThreadGetChildTimeout(inst));
++        ESP_LOGW(kDiagTag, "nudged the child timeout to force a Child Update Request carrying "
++                           "the Address Registration TLV");
++    }
++
++    esp_openthread_lock_release();
++}
++
++void diag_task(void *)
++{
++    while (true) {
++        diag_dump_once();
++        vTaskDelay(pdMS_TO_TICKS(20000));
++    }
++}
++
++} // namespace
++
+ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
+ {
+     switch (event->Type) {
+@@ -206,6 +328,7 @@
+ 
+     /* Matter start */
+     err = esp_matter::start(app_event_cb);
++    xTaskCreate(diag_task, "thread_diag", 4096, nullptr, 3, nullptr);
+     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
+ 
+     /* do nothing now */

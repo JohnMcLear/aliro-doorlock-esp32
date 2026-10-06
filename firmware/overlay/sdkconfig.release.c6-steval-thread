@@ -51,3 +51,14 @@ CONFIG_CHIP_PROGRESS_LOGGING=y
 CONFIG_CHIP_ERROR_LOGGING=y
 CONFIG_OPENTHREAD_LOG_LEVEL_WARN=n
 CONFIG_OPENTHREAD_LOG_LEVEL_INFO=y
+
+# CHIPoBLE needs the ATT Handle Value Confirmation (opcode 0x1E) handler, which
+# NimBLE compiles only under MYNEWT_VAL(BLE_GATTC), which in turn needs the
+# central role. sdkconfig.esp32c6.aliro sets ROLE_CENTRAL=n, so the device
+# answered its own indications' confirmations with "Request Not Supported" and
+# PASE deadlocked on the first exchange. Proven at the ATT layer 2026-09-27 on
+# the wifi variant, see doorplan/esphome_internal/findings/
+# nimble-indication-confirm-bug.md. Commissioning is over BLE for both
+# transports, so this variant carries the same defect and the same fix.
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_GATT_CLIENT=y

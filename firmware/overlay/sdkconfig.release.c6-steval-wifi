@@ -1,0 +1,96 @@
+# Release overlay for the c6-steval-wifi bench variant (ESP32-C6 devkit
+# wired to an ST STEVAL-MB17149B over SPI, Matter over WI-FI).
+#
+# WHY THIS EXISTS, 2026-09-24. Six attempts to commission this board into
+# Apple Home over Thread failed identically. Proved the same evening that
+# the fault is the Apple TV acting as a THREAD BORDER ROUTER, not this
+# firmware: the board holds a routable OMR address and answers ping6 with
+# 0% loss through a Home Assistant border router, having returned 100%
+# loss through the Apple TV. Evidence:
+# doorplan/esphome_internal/findings/aliro-2026-09-24-inbound-works-non-apple-br.log
+#
+# A Matter-over-Wi-Fi device is not a Thread node and has no border router
+# in its path, so it cannot hit that fault at all. Commissioning still
+# starts over BLE and the Apple TV is still the home hub, but it routes
+# nothing. If this commissions, the Thread border router is conclusively
+# the problem.
+#
+# Identical to the c6-steval-thread overlay apart from the transport block
+# at the end. Every SPI reader pin, the button, the console and the debug
+# logging are unchanged, so a difference in behaviour can only be transport.
+#
+# Layered on top of examples/door_lock/sdkconfig.esp32c6.aliro. The base
+# supplies every Aliro, Thread, BLE, mbedTLS and partition setting. Its
+# CONFIG_ST25R3916_PIN_SDA/SCL lines belong to the m5nfc component, which
+# this variant does not build, so idf.py reports them as unknown and
+# ignores them.
+
+# --- BOOT button on GPIO 9, active-low -----------------------------------
+CONFIG_BSP_BUTTONS_NUM=1
+CONFIG_BSP_BUTTON_1_TYPE_GPIO=y
+CONFIG_BSP_BUTTON_1_GPIO=9
+CONFIG_BSP_BUTTON_1_LEVEL=0
+
+# --- No BSP LEDs ---------------------------------------------------------
+# The audited Aliro source drives the devkit's WS2812 on GPIO 8 itself.
+CONFIG_BSP_LEDS_NUM=0
+
+# --- Native USB console ---------------------------------------------------
+# The devkit's USB port used here is the ESP32-C6 USB Serial/JTAG
+# controller (303a:1001, /dev/ttyACM*).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# --- ST25R3916B on SPI (st25r3916_spi component) --------------------------
+# Must match firmware/board_config/c6_steval.h and variants.json.
+CONFIG_ST25R3916_SPI_HOST=1
+CONFIG_ST25R3916_SPI_PIN_SCLK=19
+CONFIG_ST25R3916_SPI_PIN_MISO=10
+CONFIG_ST25R3916_SPI_PIN_MOSI=18
+CONFIG_ST25R3916_SPI_PIN_CS=6
+CONFIG_ST25R3916_SPI_PIN_IRQ=7
+CONFIG_ST25R3916_SPI_FREQ_HZ=1000000
+CONFIG_ST25R3916_TRANSCEIVE_TIMEOUT_MS=100
+CONFIG_ST25R3916_SPI_ANTENNA_TUNING=y
+
+# --- Commissioning debug, 2026-09-21 --------------------------------------
+# Apple Home timed out twice adding this board, after accepting it as an
+# uncertified accessory, so the question is how far a commissioner gets. The
+# stock levels hide the answer: CHIP logs progress only, and OpenThread is
+# silent below warnings, so a Thread attach that never happens looks the same
+# as one that did. app_main pins the NFC tags back to INFO, because the poller
+# runs every 50 ms and would bury the rest.
+# Log level stays at INFO. Raising the maximum to DEBUG compiles debug log
+# lines inside connectedhomeip that do not build under this toolchain:
+# commodity-tariff-server.cpp prints uint32_t with %u and the build treats
+# format warnings as errors. Upstream's problem, in a cluster nothing here
+# uses, and INFO is enough: Matter progress logging, OpenThread at info, and
+# the commissioning lines added by patch 0024, which log at warning.
+CONFIG_CHIP_PROGRESS_LOGGING=y
+CONFIG_CHIP_ERROR_LOGGING=y
+CONFIG_OPENTHREAD_LOG_LEVEL_WARN=n
+CONFIG_OPENTHREAD_LOG_LEVEL_INFO=y
+
+# --- Transport: Wi-Fi station on, OpenThread off -------------------------
+# The base config enables OpenThread and disables the Wi-Fi station.
+# Invert both for a Matter-over-Wi-Fi build. Matter commissioning still
+# runs over BLE; the phone supplies the Wi-Fi credentials. Same two lines
+# as the audited nanoc6-wifi overlay.
+#
+# The ESP32-C6 is 2.4 GHz only, which is what Matter over Wi-Fi specifies.
+# New risks this introduces, all on the LAN rather than in the Apple TV:
+# AP client isolation, mDNS and IPv6 multicast, and band steering putting
+# the phone on 5 GHz while the board can only join 2.4.
+CONFIG_ENABLE_WIFI_STATION=y
+CONFIG_OPENTHREAD_ENABLED=n
+
+# OpenThread is off, so its log levels above are inert. Left in place so
+# this file stays a line-for-line comparison with the thread overlay.
+
+# CHIPoBLE needs the ATT Handle Value Confirmation (opcode 0x1E) handler, which
+# NimBLE compiles only under MYNEWT_VAL(BLE_GATTC), which in turn needs the
+# central role. sdkconfig.esp32c6.aliro sets ROLE_CENTRAL=n, so the device
+# answered its own indications' confirmations with "Request Not Supported" and
+# PASE deadlocked on the first exchange. Proven at the ATT layer 2026-09-27,
+# see doorplan/esphome_internal/findings/aliro-wifi-3layer-2026-09-27.log
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_GATT_CLIENT=y

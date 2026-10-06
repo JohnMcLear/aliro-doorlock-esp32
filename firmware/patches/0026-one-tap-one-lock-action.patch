@@ -1,0 +1,53 @@
+diff --git a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+index 9118c11..487c738 100644
+--- a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
++++ b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+@@ -481,6 +481,21 @@ esp_err_t AliroDoorLockDelegate::NfcMessageExchange(const uint8_t *command, size
+     return err;
+ }
+ 
++// One tap = one lock action.
++//
++// A phone held on the reader re-authenticates every ~200 ms: measured 6 unlocks in
++// 1.2 s, each driving the lock output and sending ReportData to both Apple fabrics
++// (and with the tap toggle of patch 0007, flipping the lock back and forth). After a
++// successful transaction the reader latches: nothing in the field is processed again
++// until the field has been empty for kTapFieldClearUs. A second deliberate tap
++// therefore needs the phone or card lifted away for about a second, which is how
++// people tap anyway. The latch is per field, not per credential: the session handle
++// does not expose which credential answered, and a different person cannot be in the
++// field at the same instant as the first.
++constexpr int64_t kTapFieldClearUs = 1000 * 1000;
++static bool g_tap_latched = false;
++static int64_t g_tap_last_seen_us = 0;
++
+ void AliroDoorLockDelegate::NfcDetectTask(void *delegate)
+ {
+     AliroDoorLockDelegate *doorLockDelegate = (AliroDoorLockDelegate *)delegate;
+@@ -488,6 +503,17 @@ void AliroDoorLockDelegate::NfcDetectTask(void *delegate)
+         m5nfc_update();
+         m5nfc_activation_result_t activation = m5nfc_activate();
+         if (activation == M5NFC_ACTIVATION_NONE) {
++            if (g_tap_latched && esp_timer_get_time() - g_tap_last_seen_us >= kTapFieldClearUs) {
++                g_tap_latched = false;
++                ESP_LOGI("Aliro", "Field clear; the next tap is accepted");
++            }
++            vTaskDelay(pdMS_TO_TICKS(100));
++            continue;
++        }
++        g_tap_last_seen_us = esp_timer_get_time();
++        if (g_tap_latched) {
++            // Same presentation as the tap that already acted: ignore it until the field clears.
++            m5nfc_deactivate();
+             vTaskDelay(pdMS_TO_TICKS(100));
+             continue;
+         }
+@@ -525,6 +551,8 @@ void AliroDoorLockDelegate::NfcDetectTask(void *delegate)
+         }
+         const int64_t session_time_ms = (esp_timer_get_time() - session_start_us) / 1000;
+         if (err == ESP_OK) {
++            g_tap_latched = true;
++            g_tap_last_seen_us = esp_timer_get_time();
+             ShowStatusLed(StatusLedResult::kSuccess);
+             ESP_LOGI("Aliro", "Aliro NFC transaction completed successfully in %lld ms", (long long)session_time_ms);
+             (void) DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
